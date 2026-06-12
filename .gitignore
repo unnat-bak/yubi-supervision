@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+backend/models/*.task
+*.pt
+.DS_Store

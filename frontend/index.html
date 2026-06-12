@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>YUBI Supervision</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div id="video-wrap">
+      <img id="stream" alt="" />
+      <div id="idle-overlay" class="idle-overlay">
+        <div class="idle-content glass">
+          <p class="idle-title">YUBI Supervision</p>
+          <p class="idle-sub">Live object &amp; keypoint vision</p>
+          <p class="idle-hint">Press Start Vision or hit <kbd>Space</kbd></p>
+        </div>
+      </div>
+      <div id="loading-overlay" class="loading-overlay" hidden>
+        <div class="loader"></div>
+        <p id="loading-text">Loading models &amp; camera…</p>
+      </div>
+
+      <header class="glass top-bar">
+        <span class="brand">YUBI Supervision</span>
+        <div id="status-pill" class="status-pill idle">
+          <span class="status-dot"></span>
+          <span id="status-label">Idle</span>
+        </div>
+      </header>
+
+      <div id="stats-bar" class="stats-bar" hidden>
+        <div class="stat-card">
+          <span class="stat-value" id="stat-objects">0</span>
+          <span class="stat-label">Objects</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value" id="stat-pose">0</span>
+          <span class="stat-label">Pose</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value" id="stat-face">0</span>
+          <span class="stat-label">Face</span>
+        </div>
+        <div class="stat-card">
+          <span class="stat-value" id="stat-hands">0</span>
+          <span class="stat-label">Hands</span>
+        </div>
+        <div class="stat-card stat-fps">
+          <span class="stat-value" id="stat-fps">—</span>
+          <span class="stat-label">FPS</span>
+        </div>
+      </div>
+
+      <aside id="detections-panel" class="glass detections-panel" hidden>
+        <div class="panel-header">
+          <span class="panel-title">Detections</span>
+          <span id="object-total" class="panel-badge">0</span>
+        </div>
+        <label class="confidence-control">
+          <span>Sensitivity</span>
+          <input id="confidence-slider" type="range" min="10" max="90" value="35" />
+          <span id="confidence-value">35%</span>
+        </label>
+        <ul id="detections-list" class="detections-list"></ul>
+        <p id="detections-empty" class="detections-empty">No objects in frame</p>
+      </aside>
+
+      <footer class="glass bottom-bar">
+        <div id="layer-toggles" class="layer-toggles">
+          <button class="layer-chip active" data-layer="show_objects">Objects</button>
+          <button class="layer-chip active" data-layer="show_pose">Pose</button>
+          <button class="layer-chip active" data-layer="show_face">Face</button>
+          <button class="layer-chip active" data-layer="show_hands">Hands</button>
+        </div>
+        <div class="controls">
+          <button id="btn-start" class="btn btn-primary">Start Vision</button>
+          <button id="btn-stop" class="btn btn-secondary" disabled>Stop</button>
+        </div>
+        <p class="shortcut-hint"><kbd>Q</kbd> / <kbd>Esc</kbd> stop · <kbd>Space</kbd> start</p>
+      </footer>
+
+      <p id="error-msg" class="error-msg" hidden></p>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
