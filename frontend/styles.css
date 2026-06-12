@@ -6,6 +6,10 @@
   padding: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body {
   width: 100%;
@@ -131,6 +135,20 @@ body {
   color: rgba(255, 255, 255, 0.88);
 }
 
+.degraded-badge {
+  margin-left: auto;
+  margin-right: 14px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.12);
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  animation: slideUp 0.35s ease;
+}
+
 .status-pill {
   display: flex;
   align-items: center;
@@ -188,9 +206,12 @@ body {
   min-width: 72px;
   padding: 10px 14px;
   border-radius: 12px;
-  background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(12, 12, 14, 0.55);
+  backdrop-filter: blur(14px) saturate(140%);
+  -webkit-backdrop-filter: blur(14px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   text-align: center;
+  animation: slideUp 0.35s ease;
 }
 
 .stat-value {
@@ -487,6 +508,45 @@ body {
   border: 1px solid rgba(255, 255, 255, 0.18);
 }
 
+.rec-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.4);
+  vertical-align: 1px;
+  transition: background 0.2s ease;
+}
+
+#btn-record.recording {
+  border-color: rgba(248, 113, 113, 0.6);
+  color: #fca5a5;
+}
+
+#btn-record.recording .rec-dot {
+  background: #f87171;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.alert-banner {
+  position: absolute;
+  top: 88px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 10px 20px;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: #fbbf24;
+  background: rgba(120, 70, 10, 0.55);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(251, 191, 36, 0.45);
+  z-index: 25;
+  animation: slideUp 0.3s ease;
+}
+
 .shortcut-hint {
   font-size: 0.68rem;
   color: rgba(255, 255, 255, 0.35);
@@ -539,9 +599,13 @@ kbd {
   }
 
   .detections-panel {
-    bottom: 240px;
+    bottom: 272px;
     width: calc(100vw - 40px);
-    max-height: 28vh;
+    max-height: 24vh;
+  }
+
+  .degraded-badge {
+    display: none;
   }
 
   .shortcut-hint {

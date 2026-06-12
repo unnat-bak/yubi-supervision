@@ -29,6 +29,7 @@
 
       <header class="glass top-bar">
         <span class="brand">YUBI Supervision</span>
+        <span id="degraded-badge" class="degraded-badge" hidden></span>
         <div id="status-pill" class="status-pill idle">
           <span class="status-dot"></span>
           <span id="status-label">Idle</span>
@@ -56,6 +57,10 @@
           <span class="stat-value" id="stat-fps">—</span>
           <span class="stat-label">FPS</span>
         </div>
+        <div class="stat-card stat-fps">
+          <span class="stat-value" id="stat-latency">—</span>
+          <span class="stat-label">MS</span>
+        </div>
       </div>
 
       <aside id="detections-panel" class="glass detections-panel" hidden>
@@ -82,11 +87,16 @@
         <div class="controls">
           <button id="btn-start" class="btn btn-primary">Start Vision</button>
           <button id="btn-stop" class="btn btn-secondary" disabled>Stop</button>
+          <button id="btn-snapshot" class="btn btn-secondary" disabled>Snapshot</button>
+          <button id="btn-record" class="btn btn-secondary" disabled>
+            <span class="rec-dot"></span>Rec
+          </button>
         </div>
         <p class="shortcut-hint"><kbd>Q</kbd> / <kbd>Esc</kbd> stop · <kbd>Space</kbd> start</p>
       </footer>
 
       <p id="error-msg" class="error-msg" hidden></p>
+      <div id="alert-banner" class="alert-banner" hidden></div>
     </div>
     <script src="/static/app.js"></script>
   </body>

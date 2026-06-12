@@ -32,8 +32,12 @@ class StatusResponse(BaseModel):
     hand_count: int = 0
     object_count: int = 0
     fps: float = 0.0
+    latency_ms: float = 0.0
     objects: list[dict[str, Any]] = Field(default_factory=list)
     tracks: list[dict[str, Any]] = Field(default_factory=list)
+    degraded: list[str] = Field(default_factory=list)
+    recording: bool = False
+    alerts: list[dict[str, Any]] = Field(default_factory=list)
     startup_message: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None

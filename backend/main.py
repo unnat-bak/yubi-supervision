@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import get_settings
@@ -13,7 +14,14 @@ from backend.vision import VisionEngine
 settings = get_settings()
 engine = VisionEngine(settings=settings)
 
-app = FastAPI(title=settings.app_name)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    await asyncio.to_thread(engine.stop)
+
+
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
 @app.get("/")
@@ -54,7 +62,7 @@ async def start_vision() -> StartResponse:
 
 @app.post("/api/stop", response_model=StartResponse)
 async def stop_vision() -> StartResponse:
-    engine.stop()
+    await asyncio.to_thread(engine.stop)
     return StartResponse(state="idle")
 
 
@@ -69,12 +77,51 @@ async def status() -> StatusResponse:
         hand_count=stats.hand_count,
         object_count=stats.object_count,
         fps=stats.fps,
+        latency_ms=stats.latency_ms,
         objects=stats.objects,
         tracks=stats.tracks,
+        degraded=stats.degraded,
+        recording=stats.recording,
+        alerts=stats.alerts,
         startup_message=stats.startup_message,
         config=config.__dict__,
         error=stats.error,
     )
+
+
+@app.get("/api/snapshot")
+async def snapshot() -> Response:
+    result = await asyncio.to_thread(engine.get_snapshot)
+    if result is None:
+        raise HTTPException(status_code=409, detail="Vision is not live")
+    png, _ = result
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Content-Disposition": "attachment; filename=snapshot.png"},
+    )
+
+
+@app.get("/api/snapshot/json")
+async def snapshot_json() -> dict:
+    result = await asyncio.to_thread(engine.get_snapshot)
+    if result is None:
+        raise HTTPException(status_code=409, detail="Vision is not live")
+    _, payload = result
+    return payload
+
+
+@app.post("/api/record/start")
+async def record_start() -> dict:
+    if not engine.request_recording("start"):
+        raise HTTPException(status_code=409, detail="Vision is not live")
+    return {"recording": True}
+
+
+@app.post("/api/record/stop")
+async def record_stop() -> dict:
+    engine.request_recording("stop")
+    return {"recording": False}
 
 
 async def mjpeg_stream():

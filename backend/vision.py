@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -43,14 +45,21 @@ CAMERA_ERROR = (
     "Could not access the webcam. On macOS, grant camera permission under "
     "System Settings → Privacy & Security → Camera for Terminal or your Python runtime."
 )
-def ensure_models(models_dir: Path) -> None:
+def ensure_models(models_dir: Path, timeout_sec: float = 60.0) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     for filename, url in MODEL_URLS.items():
         dest = models_dir / filename
         if dest.exists():
             continue
         print(f"Downloading {filename}...")
-        urllib.request.urlretrieve(url, dest)
+        tmp = dest.with_suffix(".download")
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_sec) as response:
+                tmp.write_bytes(response.read())
+            tmp.rename(dest)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
         print(f"Saved {dest}")
 
 
@@ -157,8 +166,12 @@ class VisionStats:
     hand_count: int = 0
     object_count: int = 0
     fps: float = 0.0
+    latency_ms: float = 0.0
     objects: list[dict[str, float | int | str]] = field(default_factory=list)
     tracks: list[dict[str, float | int | str | None]] = field(default_factory=list)
+    degraded: list[str] = field(default_factory=list)
+    recording: bool = False
+    alerts: list[dict[str, float | str]] = field(default_factory=list)
     startup_message: str | None = None
     error: str | None = None
 
@@ -179,7 +192,15 @@ class VisionEngine:
         self._face: mp.tasks.vision.FaceLandmarker | None = None
         self._hand: mp.tasks.vision.HandLandmarker | None = None
         self._yolo: YOLO | None = None
-        self._tracker = sv.ByteTrack(minimum_consecutive_frames=2)
+        self._tracker = self._make_tracker()
+        self._record_request: str | None = None
+        self._alerts: list[dict[str, float | str]] = []
+        self._alert_last_fired: dict[str, float] = {}
+        self._watch_labels = {
+            label.strip().lower()
+            for label in self._settings.alert_classes.split(",")
+            if label.strip()
+        }
         self._palette = sv.ColorPalette.from_hex([
             "#FFB020", "#22C55E", "#4DA3FF", "#FF6B6B", "#A78BFA",
             "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", "#E879F9",
@@ -205,6 +226,17 @@ class VisionEngine:
             text_thickness=1,
             text_padding=6,
             color_lookup=sv.ColorLookup.CLASS,
+        )
+
+    @staticmethod
+    def _make_tracker() -> sv.ByteTrack:
+        # Long lost_track_buffer keeps IDs stable through brief occlusions;
+        # minimum_consecutive_frames filters one-frame false positives.
+        return sv.ByteTrack(
+            track_activation_threshold=0.25,
+            lost_track_buffer=60,
+            minimum_matching_threshold=0.8,
+            minimum_consecutive_frames=2,
         )
 
     @property
@@ -253,17 +285,91 @@ class VisionEngine:
                 hand_count=self._stats.hand_count,
                 object_count=self._stats.object_count,
                 fps=self._stats.fps,
+                latency_ms=self._stats.latency_ms,
                 objects=list(self._stats.objects),
                 tracks=list(self._stats.tracks),
+                degraded=list(self._stats.degraded),
+                recording=self._stats.recording,
+                alerts=list(self._stats.alerts),
                 startup_message=self._stats.startup_message,
                 error=self._stats.error,
             )
+
+    def get_snapshot(self) -> tuple[bytes, dict] | None:
+        jpeg = self.get_latest_jpeg()
+        if not jpeg:
+            return None
+        img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+        ok, png = cv2.imencode(".png", img)
+        if not ok:
+            return None
+        stats = self.get_stats()
+        payload = {
+            "captured_at": datetime.now().isoformat(timespec="seconds"),
+            "object_count": stats.object_count,
+            "objects": stats.objects,
+            "tracks": stats.tracks,
+            "fps": stats.fps,
+            "latency_ms": stats.latency_ms,
+        }
+        return png.tobytes(), payload
+
+    def request_recording(self, action: str) -> bool:
+        with self._lock:
+            if not self._running:
+                return False
+            self._record_request = action
+            return True
+
+    def _fire_alerts(self, object_summary: list[dict]) -> list[dict[str, float | str]]:
+        if not self._watch_labels:
+            return list(self._alerts)
+        present = {str(item["label"]).lower() for item in object_summary}
+        now_ts = time.time()
+        for label in sorted(present & self._watch_labels):
+            if now_ts - self._alert_last_fired.get(label, 0.0) < (
+                self._settings.alert_cooldown_sec
+            ):
+                continue
+            self._alert_last_fired[label] = now_ts
+            alert: dict[str, float | str] = {
+                "label": label,
+                "ts": round(now_ts, 2),
+                "time": datetime.now().strftime("%H:%M:%S"),
+            }
+            self._alerts.append(alert)
+            self._alerts = self._alerts[-20:]
+            if self._settings.alert_webhook_url:
+                threading.Thread(
+                    target=self._post_webhook, args=(alert,), daemon=True
+                ).start()
+        return list(self._alerts)
+
+    def _post_webhook(self, alert: dict[str, float | str]) -> None:
+        try:
+            request = urllib.request.Request(
+                self._settings.alert_webhook_url,
+                data=json.dumps(alert).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(request, timeout=3)
+        except Exception as exc:
+            print(f"Alert webhook failed: {exc}")
 
     def _set_startup_message(self, message: str) -> None:
         with self._lock:
             self._stats = VisionStats(state="starting", startup_message=message)
 
     def _open_camera(self) -> cv2.VideoCapture:
+        if self._settings.camera_source:
+            cap = cv2.VideoCapture(self._settings.camera_source)
+            if not cap.isOpened():
+                cap.release()
+                raise RuntimeError(
+                    f"Could not open video source: {self._settings.camera_source}"
+                )
+            return cap
+
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
         result: dict[str, cv2.VideoCapture | None] = {"cap": None}
 
@@ -311,68 +417,96 @@ class VisionEngine:
         )
         self._bootstrap_thread.start()
 
+    def _still_starting(self) -> bool:
+        with self._lock:
+            return self._starting
+
     def _bootstrap(self) -> None:
         cap = None
         pose = None
         face = None
         hand = None
+        yolo = None
+        degraded: list[str] = []
         try:
             models_dir = self._settings.models_dir
             self._set_startup_message("Checking MediaPipe models…")
-            ensure_models(models_dir)
+            try:
+                ensure_models(models_dir)
+            except Exception as exc:
+                print(f"Model download failed (continuing degraded): {exc}")
 
-            with self._lock:
-                if not self._starting:
-                    return
+            if not self._still_starting():
+                return
 
             self._set_startup_message("Opening webcam…")
             cap = self._open_camera()
 
-            with self._lock:
-                if not self._starting:
-                    cap.release()
-                    return
+            if not self._still_starting():
+                cap.release()
+                return
 
             self._set_startup_message("Loading pose, face, and hand models…")
             base = mp.tasks.BaseOptions
             vision = mp.tasks.vision
             running_mode = mp.tasks.vision.RunningMode.VIDEO
 
-            pose = vision.PoseLandmarker.create_from_options(
-                vision.PoseLandmarkerOptions(
-                    base_options=base(
-                        model_asset_path=str(models_dir / "pose_landmarker_lite.task")
-                    ),
-                    running_mode=running_mode,
-                    num_poses=2,
+            try:
+                pose = vision.PoseLandmarker.create_from_options(
+                    vision.PoseLandmarkerOptions(
+                        base_options=base(
+                            model_asset_path=str(models_dir / "pose_landmarker_lite.task")
+                        ),
+                        running_mode=running_mode,
+                        num_poses=2,
+                    )
                 )
-            )
-            face = vision.FaceLandmarker.create_from_options(
-                vision.FaceLandmarkerOptions(
-                    base_options=base(
-                        model_asset_path=str(models_dir / "face_landmarker.task")
-                    ),
-                    running_mode=running_mode,
-                    num_faces=2,
+            except Exception as exc:
+                print(f"Pose landmarker unavailable: {exc}")
+                degraded.append("pose")
+            try:
+                face = vision.FaceLandmarker.create_from_options(
+                    vision.FaceLandmarkerOptions(
+                        base_options=base(
+                            model_asset_path=str(models_dir / "face_landmarker.task")
+                        ),
+                        running_mode=running_mode,
+                        num_faces=2,
+                    )
                 )
-            )
-            hand = vision.HandLandmarker.create_from_options(
-                vision.HandLandmarkerOptions(
-                    base_options=base(
-                        model_asset_path=str(models_dir / "hand_landmarker.task")
-                    ),
-                    running_mode=running_mode,
-                    num_hands=2,
+            except Exception as exc:
+                print(f"Face landmarker unavailable: {exc}")
+                degraded.append("face")
+            try:
+                hand = vision.HandLandmarker.create_from_options(
+                    vision.HandLandmarkerOptions(
+                        base_options=base(
+                            model_asset_path=str(models_dir / "hand_landmarker.task")
+                        ),
+                        running_mode=running_mode,
+                        num_hands=2,
+                    )
                 )
-            )
+            except Exception as exc:
+                print(f"Hand landmarker unavailable: {exc}")
+                degraded.append("hands")
 
-            with self._lock:
-                if not self._starting:
-                    self._release_models(cap, pose, face, hand)
-                    return
+            if not self._still_starting():
+                self._release_models(cap, pose, face, hand)
+                return
 
             self._set_startup_message("Loading object detection model…")
-            yolo = YOLO(self._settings.yolo_model)
+            try:
+                yolo = YOLO(self._settings.yolo_model)
+            except Exception as exc:
+                print(f"YOLO unavailable: {exc}")
+                degraded.append("objects")
+
+            if pose is None and face is None and hand is None and yolo is None:
+                raise RuntimeError(
+                    "No vision models could be loaded. "
+                    "Check network access and model files, then try again."
+                )
 
             with self._lock:
                 if not self._starting:
@@ -383,11 +517,11 @@ class VisionEngine:
                 self._face = face
                 self._hand = hand
                 self._yolo = yolo
-                self._tracker = sv.ByteTrack(minimum_consecutive_frames=2)
+                self._tracker = self._make_tracker()
                 self._running = True
                 self._starting = False
                 self._latest_jpeg = None
-                self._stats = VisionStats(state="live")
+                self._stats = VisionStats(state="live", degraded=degraded)
 
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
@@ -439,8 +573,8 @@ class VisionEngine:
             frame,
             imgsz=self._settings.yolo_imgsz,
             conf=confidence,
-            iou=0.5,
-            max_det=30,
+            iou=self._settings.yolo_iou,
+            max_det=self._settings.yolo_max_det,
             verbose=False,
         )[0]
         detections = sv.Detections.from_ultralytics(results)
@@ -451,6 +585,14 @@ class VisionEngine:
         read_failures = 0
         fps_clock = time.perf_counter()
         fps_value = 0.0
+        latency_value = 0.0
+        frame_index = 0
+        stride = max(1, self._settings.yolo_stride)
+        last_detections = sv.Detections.empty()
+        writer: cv2.VideoWriter | None = None
+
+        with self._lock:
+            degraded = list(self._stats.degraded)
 
         while True:
             with self._lock:
@@ -469,12 +611,16 @@ class VisionEngine:
                     confidence=self._config.confidence,
                 )
 
-            if cap is None or pose is None or face is None or hand is None or yolo is None:
+            if cap is None:
                 break
 
             ok, frame = cap.read()
             if not ok:
                 read_failures += 1
+                if self._settings.camera_source and read_failures < 30:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.01)
+                    continue
                 if read_failures >= 30:
                     with self._lock:
                         self._running = False
@@ -489,20 +635,42 @@ class VisionEngine:
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             timestamp_ms += 33
-            pose_result = pose.detect_for_video(mp_image, timestamp_ms)
-            face_result = face.detect_for_video(mp_image, timestamp_ms)
-            hand_result = hand.detect_for_video(mp_image, timestamp_ms)
+            infer_start = time.perf_counter()
+            pose_result = pose.detect_for_video(mp_image, timestamp_ms) if pose else None
+            face_result = face.detect_for_video(mp_image, timestamp_ms) if face else None
+            hand_result = hand.detect_for_video(mp_image, timestamp_ms) if hand else None
 
-            detections = (
-                self._detect_objects(frame, yolo, config.confidence)
-                if config.show_objects
-                else sv.Detections.empty()
+            if config.show_objects and yolo is not None:
+                if frame_index % stride == 0:
+                    last_detections = self._detect_objects(
+                        frame, yolo, config.confidence
+                    )
+                detections = last_detections
+            else:
+                detections = sv.Detections.empty()
+                last_detections = detections
+            frame_index += 1
+            infer_ms = (time.perf_counter() - infer_start) * 1000.0
+            latency_value = (
+                0.85 * latency_value + 0.15 * infer_ms if latency_value else infer_ms
             )
 
             resolution = (width, height)
-            pose_kp = sv.KeyPoints.from_mediapipe(pose_result, resolution)
-            face_kp = sv.KeyPoints.from_mediapipe(face_result, resolution)
-            hand_kp = keypoints_from_hands(hand_result, resolution)
+            pose_kp = (
+                sv.KeyPoints.from_mediapipe(pose_result, resolution)
+                if pose_result
+                else sv.KeyPoints.empty()
+            )
+            face_kp = (
+                sv.KeyPoints.from_mediapipe(face_result, resolution)
+                if face_result
+                else sv.KeyPoints.empty()
+            )
+            hand_kp = (
+                keypoints_from_hands(hand_result, resolution)
+                if hand_result
+                else sv.KeyPoints.empty()
+            )
 
             annotated = frame.copy()
             if config.show_objects and not detections.is_empty():
@@ -524,6 +692,25 @@ class VisionEngine:
                 annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
                 annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
 
+            with self._lock:
+                record_request = self._record_request
+                self._record_request = None
+            if record_request == "start" and writer is None:
+                recordings_dir = self._settings.recordings_dir
+                recordings_dir.mkdir(parents=True, exist_ok=True)
+                clip_name = datetime.now().strftime("clip-%Y%m%d-%H%M%S.mp4")
+                writer = cv2.VideoWriter(
+                    str(recordings_dir / clip_name),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    max(fps_value, 10.0),
+                    (width, height),
+                )
+            elif record_request == "stop" and writer is not None:
+                writer.release()
+                writer = None
+            if writer is not None:
+                writer.write(annotated)
+
             ok, jpeg = cv2.imencode(
                 ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
             )
@@ -536,8 +723,10 @@ class VisionEngine:
             if elapsed > 0:
                 fps_value = 0.85 * fps_value + 0.15 * (1.0 / elapsed)
 
-            object_summary = summarize_objects(detections, yolo.names)
-            track_items = list_tracked_objects(detections, yolo.names)
+            class_names = yolo.names if yolo is not None else {}
+            object_summary = summarize_objects(detections, class_names)
+            track_items = list_tracked_objects(detections, class_names)
+            alert_items = self._fire_alerts(object_summary)
             with self._lock:
                 self._latest_jpeg = jpeg.tobytes()
                 self._stats = VisionStats(
@@ -547,8 +736,15 @@ class VisionEngine:
                     hand_count=len(hand_kp.xy) if config.show_hands else 0,
                     object_count=len(detections),
                     fps=round(fps_value, 1),
+                    latency_ms=round(latency_value, 1),
                     objects=object_summary,
                     tracks=track_items,
+                    degraded=degraded,
+                    recording=writer is not None,
+                    alerts=alert_items,
                 )
 
             time.sleep(0.001)
+
+        if writer is not None:
+            writer.release()
