@@ -1,0 +1,12 @@
+---
+description: YUBI Supervision project conventions for agents
+alwaysApply: true
+---
+
+Read `AGENTS.md` before making changes. For architecture or scaling decisions, also read `docs/ARCHITECTURE.md`.
+
+- Keep `backend/main.py` thin; vision logic stays in `backend/vision.py`.
+- Never block the FastAPI event loop with camera or model initialization — use `VisionEngine.start_async()`.
+- Webcam capture is server-side OpenCV; macOS camera permission applies to the Python process.
+- Use env-based settings via `backend/config.py`; update `.env.example` when adding variables.
+- Do not commit `.venv/`, `.env`, `*.pt`, or `backend/models/*.task`.

@@ -13,7 +13,7 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
-MODELS_DIR = Path(__file__).parent / "models"
+from backend.config import Settings, get_settings
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -39,20 +39,14 @@ HAND_CONNECTIONS = (
     (5, 9), (9, 13), (13, 17),
 )
 
-YOLO_IMGSZ = 640
-DEFAULT_CONFIDENCE = 0.35
-
 CAMERA_ERROR = (
     "Could not access the webcam. On macOS, grant camera permission under "
     "System Settings → Privacy & Security → Camera for Terminal or your Python runtime."
 )
-CAMERA_TIMEOUT_SEC = 12
-
-
-def ensure_models() -> None:
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+def ensure_models(models_dir: Path) -> None:
+    models_dir.mkdir(parents=True, exist_ok=True)
     for filename, url in MODEL_URLS.items():
-        dest = MODELS_DIR / filename
+        dest = models_dir / filename
         if dest.exists():
             continue
         print(f"Downloading {filename}...")
@@ -152,7 +146,7 @@ class VisionConfig:
     show_pose: bool = True
     show_face: bool = True
     show_hands: bool = True
-    confidence: float = DEFAULT_CONFIDENCE
+    confidence: float = 0.35
 
 
 @dataclass
@@ -170,7 +164,8 @@ class VisionStats:
 
 
 class VisionEngine:
-    def __init__(self) -> None:
+    def __init__(self, settings: Settings | None = None) -> None:
+        self._settings = settings or get_settings()
         self._lock = threading.Lock()
         self._running = False
         self._starting = False
@@ -178,7 +173,7 @@ class VisionEngine:
         self._bootstrap_thread: threading.Thread | None = None
         self._latest_jpeg: bytes | None = None
         self._stats = VisionStats()
-        self._config = VisionConfig()
+        self._config = VisionConfig(confidence=self._settings.default_confidence)
         self._cap: cv2.VideoCapture | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
@@ -272,10 +267,12 @@ class VisionEngine:
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
         result: dict[str, cv2.VideoCapture | None] = {"cap": None}
 
+        settings = self._settings
+
         def opener() -> None:
-            cap = cv2.VideoCapture(0, backend)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            cap = cv2.VideoCapture(settings.camera_index, backend)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.camera_width)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.camera_height)
             if not cap.isOpened():
                 cap.release()
                 return
@@ -287,7 +284,7 @@ class VisionEngine:
 
         opener_thread = threading.Thread(target=opener, daemon=True)
         opener_thread.start()
-        opener_thread.join(timeout=CAMERA_TIMEOUT_SEC)
+        opener_thread.join(timeout=settings.camera_timeout_sec)
         if opener_thread.is_alive():
             raise RuntimeError(
                 "Camera timed out. Allow camera access in System Settings, "
@@ -320,8 +317,9 @@ class VisionEngine:
         face = None
         hand = None
         try:
+            models_dir = self._settings.models_dir
             self._set_startup_message("Checking MediaPipe models…")
-            ensure_models()
+            ensure_models(models_dir)
 
             with self._lock:
                 if not self._starting:
@@ -343,7 +341,7 @@ class VisionEngine:
             pose = vision.PoseLandmarker.create_from_options(
                 vision.PoseLandmarkerOptions(
                     base_options=base(
-                        model_asset_path=str(MODELS_DIR / "pose_landmarker_lite.task")
+                        model_asset_path=str(models_dir / "pose_landmarker_lite.task")
                     ),
                     running_mode=running_mode,
                     num_poses=2,
@@ -352,7 +350,7 @@ class VisionEngine:
             face = vision.FaceLandmarker.create_from_options(
                 vision.FaceLandmarkerOptions(
                     base_options=base(
-                        model_asset_path=str(MODELS_DIR / "face_landmarker.task")
+                        model_asset_path=str(models_dir / "face_landmarker.task")
                     ),
                     running_mode=running_mode,
                     num_faces=2,
@@ -361,7 +359,7 @@ class VisionEngine:
             hand = vision.HandLandmarker.create_from_options(
                 vision.HandLandmarkerOptions(
                     base_options=base(
-                        model_asset_path=str(MODELS_DIR / "hand_landmarker.task")
+                        model_asset_path=str(models_dir / "hand_landmarker.task")
                     ),
                     running_mode=running_mode,
                     num_hands=2,
@@ -374,7 +372,7 @@ class VisionEngine:
                     return
 
             self._set_startup_message("Loading object detection model…")
-            yolo = YOLO("yolov8s.pt")
+            yolo = YOLO(self._settings.yolo_model)
 
             with self._lock:
                 if not self._starting:
@@ -439,7 +437,7 @@ class VisionEngine:
     ) -> sv.Detections:
         results = yolo(
             frame,
-            imgsz=YOLO_IMGSZ,
+            imgsz=self._settings.yolo_imgsz,
             conf=confidence,
             iou=0.5,
             max_det=30,

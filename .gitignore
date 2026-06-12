@@ -2,6 +2,12 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.env
 backend/models/*.task
 *.pt
 .DS_Store
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/

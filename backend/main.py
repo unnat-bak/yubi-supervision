@@ -1,81 +1,80 @@
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
-from typing import Any, Optional
 
 from fastapi import FastAPI
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
+from backend.config import get_settings
+from backend.schemas import ConfigUpdate, HealthResponse, StartResponse, StatusResponse
 from backend.vision import VisionEngine
 
-ROOT = Path(__file__).resolve().parent.parent
-FRONTEND = ROOT / "frontend"
+settings = get_settings()
+engine = VisionEngine(settings=settings)
 
-app = FastAPI(title="YUBI Supervision")
-engine = VisionEngine()
-
-
-class ConfigUpdate(BaseModel):
-    show_objects: Optional[bool] = None
-    show_pose: Optional[bool] = None
-    show_face: Optional[bool] = None
-    show_hands: Optional[bool] = None
-    confidence: Optional[float] = Field(default=None, ge=0.1, le=0.95)
+app = FastAPI(title=settings.app_name)
 
 
 @app.get("/")
 async def index() -> FileResponse:
-    return FileResponse(FRONTEND / "index.html")
+    return FileResponse(settings.frontend_dir / "index.html")
+
+
+@app.get("/api/health", response_model=HealthResponse)
+async def health() -> HealthResponse:
+    stats = engine.get_stats()
+    return HealthResponse(
+        app=settings.app_name,
+        vision_state=stats.state,
+    )
 
 
 @app.get("/api/config")
-async def get_config() -> dict[str, Any]:
+async def get_config() -> dict:
     config = engine.get_config()
     return config.__dict__
 
 
 @app.post("/api/config")
-async def update_config(payload: ConfigUpdate) -> dict[str, Any]:
+async def update_config(payload: ConfigUpdate) -> dict:
     config = engine.update_config(**payload.model_dump(exclude_none=True))
     return config.__dict__
 
 
-@app.post("/api/start")
-async def start_vision() -> dict:
+@app.post("/api/start", response_model=StartResponse)
+async def start_vision() -> StartResponse:
     if engine.is_running:
-        return {"state": "live"}
+        return StartResponse(state="live")
     if engine.is_starting:
-        return {"state": "starting"}
+        return StartResponse(state="starting")
     engine.start_async()
-    return {"state": "starting"}
+    return StartResponse(state="starting")
 
 
-@app.post("/api/stop")
-async def stop_vision() -> dict:
+@app.post("/api/stop", response_model=StartResponse)
+async def stop_vision() -> StartResponse:
     engine.stop()
-    return {"state": "idle"}
+    return StartResponse(state="idle")
 
 
-@app.get("/api/status")
-async def status() -> dict:
+@app.get("/api/status", response_model=StatusResponse)
+async def status() -> StatusResponse:
     stats = engine.get_stats()
     config = engine.get_config()
-    return {
-        "state": stats.state,
-        "face_count": stats.face_count,
-        "pose_count": stats.pose_count,
-        "hand_count": stats.hand_count,
-        "object_count": stats.object_count,
-        "fps": stats.fps,
-        "objects": stats.objects,
-        "tracks": stats.tracks,
-        "startup_message": stats.startup_message,
-        "config": config.__dict__,
-        "error": stats.error,
-    }
+    return StatusResponse(
+        state=stats.state,
+        face_count=stats.face_count,
+        pose_count=stats.pose_count,
+        hand_count=stats.hand_count,
+        object_count=stats.object_count,
+        fps=stats.fps,
+        objects=stats.objects,
+        tracks=stats.tracks,
+        startup_message=stats.startup_message,
+        config=config.__dict__,
+        error=stats.error,
+    )
 
 
 async def mjpeg_stream():
@@ -98,4 +97,4 @@ async def stream() -> StreamingResponse:
     )
 
 
-app.mount("/static", StaticFiles(directory=FRONTEND), name="static")
+app.mount("/static", StaticFiles(directory=settings.frontend_dir), name="static")
