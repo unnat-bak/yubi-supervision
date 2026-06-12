@@ -21,10 +21,18 @@ const statPose = document.getElementById("stat-pose");
 const statFace = document.getElementById("stat-face");
 const statHands = document.getElementById("stat-hands");
 const statFps = document.getElementById("stat-fps");
+const statLatency = document.getElementById("stat-latency");
+const degradedBadge = document.getElementById("degraded-badge");
+const btnSnapshot = document.getElementById("btn-snapshot");
+const btnRecord = document.getElementById("btn-record");
+const alertBanner = document.getElementById("alert-banner");
 
 let pollTimer = null;
 let isLive = false;
 let configDebounce = null;
+let isRecording = false;
+let lastAlertTs = 0;
+let alertHideTimer = null;
 
 function setError(message) {
   if (message) {
@@ -106,6 +114,53 @@ function updateStats(data) {
   statFace.textContent = String(data.face_count ?? 0);
   statHands.textContent = String(data.hand_count ?? 0);
   statFps.textContent = data.fps ? data.fps.toFixed(1) : "—";
+  statLatency.textContent = data.latency_ms ? String(Math.round(data.latency_ms)) : "—";
+}
+
+function beep() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.15, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.35);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.35);
+  } catch {
+    /* audio unavailable */
+  }
+}
+
+function handleAlerts(alerts) {
+  if (!alerts?.length) return;
+  const latest = alerts[alerts.length - 1];
+  if (latest.ts <= lastAlertTs) return;
+  lastAlertTs = latest.ts;
+  alertBanner.textContent = `⚠ ${latest.label} detected · ${latest.time}`;
+  alertBanner.hidden = false;
+  beep();
+  clearTimeout(alertHideTimer);
+  alertHideTimer = setTimeout(() => {
+    alertBanner.hidden = true;
+  }, 4000);
+}
+
+function setRecordingUI(recording) {
+  isRecording = recording;
+  btnRecord.classList.toggle("recording", recording);
+  btnRecord.lastChild.textContent = recording ? "Stop Rec" : "Rec";
+}
+
+function updateDegraded(degraded) {
+  if (degraded?.length) {
+    degradedBadge.textContent = `⚠ ${degraded.join(", ")} unavailable`;
+    degradedBadge.hidden = false;
+  } else {
+    degradedBadge.hidden = true;
+  }
 }
 
 function setIdle() {
@@ -114,6 +169,10 @@ function setIdle() {
   stream.classList.remove("live");
   btnStart.disabled = false;
   btnStop.disabled = true;
+  btnSnapshot.disabled = true;
+  btnRecord.disabled = true;
+  setRecordingUI(false);
+  alertBanner.hidden = true;
   statusPill.classList.remove("live", "error");
   statusPill.classList.add("idle");
   statusLabel.textContent = "Idle";
@@ -123,6 +182,7 @@ function setIdle() {
   loadingOverlay.hidden = true;
   renderDetections([], [], 0);
   updateStats({});
+  updateDegraded([]);
   setError(null);
   stopPolling();
 }
@@ -151,6 +211,9 @@ async function refreshStatus() {
     }
     if (data.state === "live") {
       updateStats(data);
+      updateDegraded(data.degraded);
+      handleAlerts(data.alerts);
+      if (data.recording !== isRecording) setRecordingUI(data.recording);
       renderDetections(data.tracks, data.objects, data.object_count || 0);
       syncLayerChips(data.config);
       if (data.config?.confidence != null) {
@@ -224,6 +287,8 @@ async function startVision() {
     stream.src = `/api/stream?${Date.now()}`;
     stream.classList.add("live");
     btnStop.disabled = false;
+    btnSnapshot.disabled = false;
+    btnRecord.disabled = false;
     statsBar.hidden = false;
     detectionsPanel.hidden = false;
     statusPill.classList.remove("idle", "error");
@@ -249,8 +314,46 @@ async function stopVision() {
   setIdle();
 }
 
+async function takeSnapshot() {
+  if (!isLive) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  for (const [path, name] of [
+    ["/api/snapshot", `snapshot-${stamp}.png`],
+    ["/api/snapshot/json", `snapshot-${stamp}.json`],
+  ]) {
+    try {
+      const res = await fetch(path);
+      if (!res.ok) continue;
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = name;
+      a.click();
+      URL.revokeObjectURL(a.href);
+    } catch {
+      /* skip */
+    }
+  }
+}
+
+async function toggleRecording() {
+  if (!isLive) return;
+  const action = isRecording ? "stop" : "start";
+  try {
+    const res = await fetch(`/api/record/${action}`, { method: "POST" });
+    if (res.ok) {
+      const data = await res.json();
+      setRecordingUI(data.recording);
+    }
+  } catch {
+    /* keep current state */
+  }
+}
+
 btnStart.addEventListener("click", startVision);
 btnStop.addEventListener("click", stopVision);
+btnSnapshot.addEventListener("click", takeSnapshot);
+btnRecord.addEventListener("click", toggleRecording);
 
 layerToggles.addEventListener("click", (e) => {
   const chip = e.target.closest(".layer-chip");

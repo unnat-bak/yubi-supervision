@@ -11,3 +11,4 @@ backend/models/*.task
 *.egg-info/
 dist/
 build/
+recordings/

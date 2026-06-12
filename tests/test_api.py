@@ -31,6 +31,24 @@ def test_config_round_trip() -> None:
     assert response.json()["confidence"] == 0.5
 
 
+def test_snapshot_requires_live() -> None:
+    response = client.get("/api/snapshot")
+    assert response.status_code == 409
+
+    response = client.get("/api/snapshot/json")
+    assert response.status_code == 409
+
+
+def test_record_requires_live() -> None:
+    response = client.post("/api/record/start")
+    assert response.status_code == 409
+
+    # stop is idempotent and safe when idle
+    response = client.post("/api/record/stop")
+    assert response.status_code == 200
+    assert response.json() == {"recording": False}
+
+
 def test_start_stop_lifecycle() -> None:
     response = client.get("/api/status")
     assert response.status_code == 200

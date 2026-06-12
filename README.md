@@ -36,7 +36,45 @@ curl http://127.0.0.1:8000/api/health
 curl -X POST http://127.0.0.1:8000/api/start
 curl http://127.0.0.1:8000/api/status
 curl -X POST http://127.0.0.1:8000/api/stop
+
+./scripts/smoke.sh                       # full lifecycle integration test
 ```
+
+`/api/status` reports `fps`, `latency_ms` (inference EMA), and `degraded` — a list
+of subsystems (`pose`, `face`, `hands`, `objects`) that failed to load. The engine
+goes live with whatever models loaded; it errors only if none did.
+
+To run without a webcam (testing/CI), set `CAMERA_SOURCE=path/to/video.mp4` —
+the file loops as the camera feed.
+
+## Snapshot, recording, and alerts
+
+| Endpoint | Effect |
+|----------|--------|
+| `GET /api/snapshot` | PNG of the latest annotated frame |
+| `GET /api/snapshot/json` | Detections bundle (objects, tracks, fps, latency) |
+| `POST /api/record/start` | Begin writing annotated MP4 to `recordings/` |
+| `POST /api/record/stop` | Finish the clip |
+
+Alerts fire when a watched class appears (with cooldown), shown as a UI banner +
+sound and optionally POSTed as JSON to a webhook:
+
+```bash
+ALERT_CLASSES="person,cell phone"        # comma-separated COCO labels
+ALERT_WEBHOOK_URL=https://example.com/hook   # optional
+ALERT_COOLDOWN_SEC=10
+```
+
+Recent alerts appear in `/api/status` under `alerts`; `recording` reflects clip state.
+
+## Detection tuning
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `YOLO_MODEL` | `yolov8s.pt` | `yolov8n.pt` is ~2× faster, less accurate; `yolov8m.pt` more accurate, slower |
+| `YOLO_STRIDE` | `2` | Run YOLO every N frames, reusing tracked boxes in between (FPS boost) |
+| `YOLO_IOU` | `0.5` | NMS overlap threshold |
+| `YOLO_MAX_DET` | `30` | Max detections per frame |
 
 ## macOS camera permission
 
