@@ -26,12 +26,18 @@ const degradedBadge = document.getElementById("degraded-badge");
 const btnSnapshot = document.getElementById("btn-snapshot");
 const btnRecord = document.getElementById("btn-record");
 const alertBanner = document.getElementById("alert-banner");
-const geminiPanel = document.getElementById("gemini-panel");
-const geminiState = document.getElementById("gemini-state");
-const geminiSummary = document.getElementById("gemini-summary");
-const geminiList = document.getElementById("gemini-list");
-const geminiEmpty = document.getElementById("gemini-empty");
-const geminiError = document.getElementById("gemini-error");
+const analysisPanel = document.getElementById("analysis-panel");
+const analysisState = document.getElementById("analysis-state");
+const analysisSummary = document.getElementById("analysis-summary");
+const analysisList = document.getElementById("analysis-list");
+const analysisEmpty = document.getElementById("analysis-empty");
+const analysisError = document.getElementById("analysis-error");
+const expressionPanel = document.getElementById("expression-panel");
+const expressionState = document.getElementById("expression-state");
+const expressionNotes = document.getElementById("expression-notes");
+const expressionList = document.getElementById("expression-list");
+const expressionEmpty = document.getElementById("expression-empty");
+const expressionError = document.getElementById("expression-error");
 
 let pollTimer = null;
 let isLive = false;
@@ -42,6 +48,7 @@ let alertHideTimer = null;
 let lastTracks = [];
 let lastGrouped = [];
 let activeThreshold = 0.35;
+let analysisEnabled = false;
 
 function setError(message) {
   if (message) {
@@ -173,7 +180,7 @@ function handleAlerts(alerts) {
   const latest = alerts[alerts.length - 1];
   if (latest.ts <= lastAlertTs) return;
   lastAlertTs = latest.ts;
-  alertBanner.textContent = `⚠ ${latest.label} detected · ${latest.time}`;
+  alertBanner.textContent = `${latest.label} detected · ${latest.time}`;
   alertBanner.hidden = false;
   beep();
   clearTimeout(alertHideTimer);
@@ -190,69 +197,137 @@ function setRecordingUI(recording) {
 
 function updateDegraded(degraded) {
   if (degraded?.length) {
-    degradedBadge.textContent = `⚠ ${degraded.join(", ")} unavailable`;
+    degradedBadge.textContent = `${degraded.join(", ")} unavailable`;
     degradedBadge.hidden = false;
   } else {
     degradedBadge.hidden = true;
   }
 }
 
-function renderGemini(gemini) {
-  if (!gemini) return;
+function syncAnalysisPanelVisibility() {
+  analysisPanel.hidden = !analysisEnabled && !isLive;
+}
+
+function renderAnalysis(analysis) {
+  if (!analysis) return;
+
+  analysisEnabled = Boolean(analysis.enabled);
+  syncAnalysisPanelVisibility();
 
   const stateLabels = {
     disabled: "Off",
     idle: "Idle",
-    thinking: "Thinking",
+    thinking: "Analyzing",
     ready: "Live",
     error: "Error",
   };
 
-  geminiState.textContent = stateLabels[gemini.state] || gemini.state;
-  geminiState.className = "panel-badge gemini-badge";
-  if (gemini.state === "thinking") geminiState.classList.add("thinking");
-  if (gemini.state === "ready") geminiState.classList.add("ready");
+  analysisState.textContent = stateLabels[analysis.state] || analysis.state;
+  analysisState.className = "panel-badge analysis-badge";
+  if (analysis.state === "thinking") analysisState.classList.add("thinking");
+  if (analysis.state === "ready") analysisState.classList.add("ready");
+  if (analysis.state === "error") analysisState.classList.add("error");
 
-  if (!gemini.enabled) {
-    geminiSummary.textContent =
-      "Add GEMINI_API_KEY to .env for semantic scene analysis.";
-    geminiList.replaceChildren();
-    geminiEmpty.hidden = true;
-    geminiError.hidden = true;
+  if (!analysis.enabled) {
+    analysisSummary.textContent = "YUBI v3.0 is not configured on this server.";
+    analysisList.replaceChildren();
+    analysisEmpty.hidden = true;
+    analysisError.hidden = true;
     return;
   }
 
-  if (gemini.error) {
-    geminiError.textContent = gemini.error;
-    geminiError.hidden = false;
+  if (analysis.error) {
+    analysisError.textContent = analysis.error;
+    analysisError.hidden = false;
   } else {
-    geminiError.hidden = true;
-    geminiError.textContent = "";
+    analysisError.hidden = true;
+    analysisError.textContent = "";
   }
 
-  geminiSummary.textContent =
-    gemini.scene_summary ||
-    (gemini.state === "thinking"
-      ? "Analyzing scene with Gemini…"
-      : "Waiting for first Gemini analysis…");
+  analysisSummary.textContent =
+    analysis.scene_summary ||
+    (analysis.state === "thinking"
+      ? "Analyzing scene…"
+      : isLive
+        ? "Waiting for first YUBI v3.0 analysis…"
+        : "Start vision for live analysis.");
 
-  geminiList.replaceChildren();
-  const items = gemini.objects || [];
-  geminiEmpty.hidden = items.length > 0 || gemini.state === "thinking";
-  geminiEmpty.textContent =
-    gemini.state === "thinking" ? "Analyzing…" : "No Gemini objects yet";
+  analysisList.replaceChildren();
+  const items = analysis.objects || [];
+  analysisEmpty.hidden = items.length > 0 || analysis.state === "thinking";
+  analysisEmpty.textContent =
+    analysis.state === "thinking" ? "Analyzing…" : "No objects identified yet";
 
   for (const item of items) {
     const li = document.createElement("li");
-    li.className = "gemini-item";
+    li.className = "analysis-item";
     const label = document.createElement("span");
-    label.className = "gemini-item-label";
+    label.className = "analysis-item-label";
     label.textContent = item.label;
     const meta = document.createElement("span");
-    meta.className = "gemini-item-meta";
-    meta.textContent = `${Math.round(item.confidence * 100)}% confidence`;
+    meta.className = "analysis-item-meta";
+    meta.textContent = `${Math.round(item.confidence * 100)}%`;
     li.append(label, meta);
-    geminiList.appendChild(li);
+    analysisList.appendChild(li);
+  }
+}
+
+function renderExpressions(expr) {
+  if (!expr) return;
+  const videoWrap = document.getElementById("video-wrap");
+  const showPanel = isLive && expr.enabled;
+  expressionPanel.hidden = !showPanel;
+  videoWrap.classList.toggle("expressions-live", showPanel);
+
+  const stateLabels = {
+    disabled: "Off",
+    idle: "Idle",
+    thinking: "Analyzing",
+    ready: "Live",
+    error: "Error",
+  };
+
+  expressionState.textContent = stateLabels[expr.state] || expr.state;
+  expressionState.className = "panel-badge expression-badge";
+  if (expr.state === "thinking") expressionState.classList.add("thinking");
+  if (expr.state === "ready") expressionState.classList.add("ready");
+  if (expr.state === "error") expressionState.classList.add("error");
+
+  if (expr.error) {
+    expressionError.textContent = expr.error;
+    expressionError.hidden = false;
+  } else {
+    expressionError.hidden = true;
+    expressionError.textContent = "";
+  }
+
+  const cues = expr.micro_cues || [];
+  const events = expr.events || [];
+  expressionNotes.textContent =
+    expr.structure_notes ||
+    (cues.length ? cues.join(" · ") : "High-precision facial grid active.");
+
+  expressionList.replaceChildren();
+  const items = events.length
+    ? events
+    : cues.map((c) => ({ label: c, intensity: null }));
+
+  expressionEmpty.hidden = items.length > 0 || expr.state === "thinking";
+  expressionEmpty.textContent =
+    expr.state === "thinking" ? "Analyzing face structure…" : "No micro-movements detected";
+
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = "expression-item";
+    const label = document.createElement("span");
+    label.className = "expression-item-label";
+    label.textContent = item.label;
+    const meta = document.createElement("span");
+    meta.className = "expression-item-meta";
+    meta.textContent =
+      item.intensity != null ? `${Math.round(item.intensity * 100)}%` : "cue";
+    li.append(label, meta);
+    expressionList.appendChild(li);
   }
 }
 
@@ -272,7 +347,9 @@ function setIdle() {
   idleOverlay.classList.remove("hidden");
   statsBar.hidden = true;
   detectionsPanel.hidden = true;
-  geminiPanel.hidden = true;
+  expressionPanel.hidden = true;
+  document.getElementById("video-wrap").classList.remove("expressions-live");
+  syncAnalysisPanelVisibility();
   loadingOverlay.hidden = true;
   renderDetections([], []);
   updateStats({});
@@ -303,6 +380,8 @@ async function refreshStatus() {
       setError(data.error);
       return;
     }
+    renderAnalysis(data.gemini);
+    renderExpressions(data.expressions);
     if (data.state === "live") {
       updateStats(data);
       updateDegraded(data.degraded);
@@ -312,7 +391,6 @@ async function refreshStatus() {
         syncThresholdDisplay(data.config.confidence);
       }
       renderDetections(data.tracks, data.objects);
-      renderGemini(data.gemini);
       syncLayerChips(data.config);
     } else if (data.state === "starting") {
       statusPill.classList.remove("idle", "live", "error");
@@ -344,6 +422,8 @@ async function waitUntilLive(timeoutMs = 120000) {
   while (Date.now() < deadline) {
     const res = await fetch("/api/status");
     const data = await res.json();
+    renderAnalysis(data.gemini);
+    renderExpressions(data.expressions);
     if (data.startup_message) {
       loadingText.textContent = data.startup_message;
     }
@@ -384,7 +464,7 @@ async function startVision() {
     btnRecord.disabled = false;
     statsBar.hidden = false;
     detectionsPanel.hidden = false;
-    geminiPanel.hidden = false;
+    syncAnalysisPanelVisibility();
     statusPill.classList.remove("idle", "error");
     statusPill.classList.add("live");
     statusLabel.textContent = "Live";
@@ -406,6 +486,7 @@ async function stopVision() {
     /* still reset UI */
   }
   setIdle();
+  refreshStatus();
 }
 
 async function takeSnapshot() {
@@ -502,6 +583,7 @@ async function hydrateFromServer() {
     if (config.confidence != null) {
       syncThresholdDisplay(config.confidence);
     }
+    renderAnalysis(status.gemini);
 
     if (status.state === "live") {
       isLive = true;
@@ -511,7 +593,7 @@ async function hydrateFromServer() {
       btnStop.disabled = false;
       statsBar.hidden = false;
       detectionsPanel.hidden = false;
-    geminiPanel.hidden = false;
+      syncAnalysisPanelVisibility();
       idleOverlay.classList.add("hidden");
       statusPill.classList.remove("idle", "error");
       statusPill.classList.add("live");
@@ -539,7 +621,7 @@ async function hydrateFromServer() {
         btnStop.disabled = false;
         statsBar.hidden = false;
         detectionsPanel.hidden = false;
-    geminiPanel.hidden = false;
+        syncAnalysisPanelVisibility();
         statusPill.classList.remove("starting", "error");
         statusPill.classList.add("live");
         statusLabel.textContent = "Live";

@@ -63,17 +63,30 @@
         </div>
       </div>
 
-      <aside id="gemini-panel" class="glass gemini-panel" hidden>
+      <aside id="analysis-panel" class="glass analysis-panel" hidden>
         <div class="panel-header">
-          <span class="panel-title">Gemini Vision</span>
-          <span id="gemini-state" class="panel-badge gemini-badge">Off</span>
+          <span class="panel-title">YUBI v3.0</span>
+          <span id="analysis-state" class="panel-badge analysis-badge">Off</span>
         </div>
-        <p id="gemini-summary" class="gemini-summary">
-          Add GEMINI_API_KEY to .env for semantic scene analysis.
+        <p id="analysis-summary" class="analysis-summary">
+          Semantic scene analysis when vision is live.
         </p>
-        <ul id="gemini-list" class="gemini-list"></ul>
-        <p id="gemini-empty" class="detections-empty" hidden>Waiting for analysis…</p>
-        <p id="gemini-error" class="gemini-error" hidden></p>
+        <ul id="analysis-list" class="analysis-list"></ul>
+        <p id="analysis-empty" class="detections-empty" hidden>Waiting for analysis…</p>
+        <p id="analysis-error" class="analysis-error" hidden></p>
+      </aside>
+
+      <aside id="expression-panel" class="glass expression-panel" hidden>
+        <div class="panel-header">
+          <span class="panel-title">Micro-expressions</span>
+          <span id="expression-state" class="panel-badge expression-badge">Off</span>
+        </div>
+        <p id="expression-notes" class="expression-notes">
+          Toggle Expressions for high-precision facial grid and micro-movement tracking.
+        </p>
+        <ul id="expression-list" class="expression-list"></ul>
+        <p id="expression-empty" class="detections-empty">No micro-movements detected</p>
+        <p id="expression-error" class="analysis-error" hidden></p>
       </aside>
 
       <aside id="detections-panel" class="glass detections-panel" hidden>
@@ -97,7 +110,8 @@
           <button class="layer-chip active" data-layer="show_pose">Pose</button>
           <button class="layer-chip active" data-layer="show_face">Face</button>
           <button class="layer-chip active" data-layer="show_hands">Hands</button>
-          <button class="layer-chip active" data-layer="show_gemini">Gemini</button>
+          <button class="layer-chip" data-layer="show_expressions">Expressions</button>
+          <button class="layer-chip active" data-layer="show_gemini">v3.0</button>
         </div>
         <div class="controls">
           <button id="btn-start" class="btn btn-primary">Start Vision</button>
