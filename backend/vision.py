@@ -5,6 +5,7 @@ import sys
 import threading
 import time
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -56,8 +57,8 @@ HAND_CONNECTIONS = (
 )
 
 CAMERA_ERROR = (
-    "Could not access the webcam. On macOS, grant camera permission under "
-    "System Settings → Privacy & Security → Camera for Terminal or your Python runtime."
+    "Could not access the webcam. Grant camera permission in System Settings "
+    "(Terminal or Python), close other apps using the camera, then click Retry."
 )
 def ensure_models(models_dir: Path, timeout_sec: float = 60.0) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -292,6 +293,9 @@ class VisionStats:
     alerts: list[dict[str, float | str]] = field(default_factory=list)
     startup_message: str | None = None
     error: str | None = None
+    session_id: str = ""
+    frame_index: int = 0
+    uptime_sec: float = 0.0
 
 
 class VisionEngine:
@@ -322,32 +326,40 @@ class VisionEngine:
             for label in self._settings.alert_classes.split(",")
             if label.strip()
         }
+        self._session_id = uuid.uuid4().hex[:8].upper()
+        self._live_since: float | None = None
+        self._frame_index = 0
         self._palette = sv.ColorPalette.from_hex([
-            "#FFB020", "#22C55E", "#4DA3FF", "#FF6B6B", "#A78BFA",
-            "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", "#E879F9",
+            "#B8A48C",
+            "#8FA89A",
+            "#9AABBC",
+            "#A89BB8",
+            "#B0A8B8",
+            "#9BA8B4",
+            "#A8B4C4",
+            "#B8B0A0",
+            "#98A8B8",
+            "#B0B8C4",
         ])
-        self._pose_edge = sv.EdgeAnnotator(color=sv.Color.GREEN, thickness=2)
-        self._face_edge = sv.EdgeAnnotator(
-            color=sv.Color.from_hex("#FF6B6B"), thickness=1
-        )
-        self._face_vertex = sv.VertexAnnotator(
-            color=sv.Color.from_hex("#FF6B6B"), radius=2
-        )
+        overlay_slate = sv.Color.from_hex("#9BA8B4")
+        overlay_pearl = sv.Color.from_hex("#C5CCD4")
+        overlay_mist = sv.Color.from_hex("#A8B4C4")
+        self._pose_edge = sv.EdgeAnnotator(color=overlay_slate, thickness=1)
+        self._face_edge = sv.EdgeAnnotator(color=overlay_pearl, thickness=1)
+        self._face_vertex = sv.VertexAnnotator(color=overlay_pearl, radius=1)
         self._hand_edge = sv.EdgeAnnotator(
-            color=sv.Color.from_hex("#4DA3FF"), thickness=2, edges=HAND_CONNECTIONS
+            color=overlay_mist, thickness=1, edges=HAND_CONNECTIONS
         )
-        self._hand_vertex = sv.VertexAnnotator(
-            color=sv.Color.from_hex("#4DA3FF"), radius=3
-        )
+        self._hand_vertex = sv.VertexAnnotator(color=overlay_mist, radius=2)
         self._box_annotator = sv.BoxAnnotator(
             color=self._palette,
-            thickness=2,
+            thickness=1,
             color_lookup=sv.ColorLookup.CLASS,
         )
         self._box_corner_annotator = sv.BoxCornerAnnotator(
             color=self._palette,
-            thickness=2,
-            corner_length=14,
+            thickness=1,
+            corner_length=10,
             color_lookup=sv.ColorLookup.CLASS,
         )
         self._label_annotator = sv.LabelAnnotator(
@@ -445,6 +457,9 @@ class VisionEngine:
 
     def get_stats(self) -> VisionStats:
         with self._lock:
+            uptime = 0.0
+            if self._live_since is not None:
+                uptime = round(time.time() - self._live_since, 1)
             return VisionStats(
                 state=self._stats.state,
                 face_count=self._stats.face_count,
@@ -460,6 +475,9 @@ class VisionEngine:
                 alerts=list(self._stats.alerts),
                 startup_message=self._stats.startup_message,
                 error=self._stats.error,
+                session_id=self._session_id,
+                frame_index=self._frame_index,
+                uptime_sec=uptime,
             )
 
     def get_snapshot(self) -> tuple[bytes, dict] | None:
@@ -471,6 +489,7 @@ class VisionEngine:
         if not ok:
             return None
         stats = self.get_stats()
+        insight = self._gemini.get_insight()
         payload = {
             "captured_at": datetime.now().isoformat(timespec="seconds"),
             "object_count": stats.object_count,
@@ -478,6 +497,21 @@ class VisionEngine:
             "tracks": stats.tracks,
             "fps": stats.fps,
             "latency_ms": stats.latency_ms,
+            "pose_count": stats.pose_count,
+            "face_count": stats.face_count,
+            "hand_count": stats.hand_count,
+            "gemini": {
+                "scene_summary": insight.scene_summary,
+                "objects": [
+                    {
+                        "label": obj.label,
+                        "confidence": obj.confidence,
+                        "box_2d": obj.box_2d,
+                    }
+                    for obj in insight.objects
+                ],
+            },
+            "expressions": self.get_expression_status(),
         }
         return png.tobytes(), payload
 
@@ -567,6 +601,18 @@ class VisionEngine:
         cap = result["cap"]
         if cap is None:
             raise RuntimeError(CAMERA_ERROR)
+        return cap
+
+    def _quick_reopen_camera(self) -> cv2.VideoCapture | None:
+        if self._settings.camera_source:
+            return None
+        backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(self._settings.camera_index, backend)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._settings.camera_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._settings.camera_height)
         return cap
 
     def start_async(self) -> None:
@@ -689,6 +735,8 @@ class VisionEngine:
                 self._running = True
                 self._starting = False
                 self._latest_jpeg = None
+                self._live_since = time.time()
+                self._frame_index = 0
                 self._stats = VisionStats(state="live", degraded=degraded)
 
             self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -738,6 +786,8 @@ class VisionEngine:
             self._hand = None
             self._yolo = None
             self._latest_jpeg = None
+            self._live_since = None
+            self._frame_index = 0
             self._stats = VisionStats(state="idle")
 
     def _detect_objects(
@@ -797,6 +847,18 @@ class VisionEngine:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                     time.sleep(0.01)
                     continue
+                if (
+                    not self._settings.camera_source
+                    and read_failures == 12
+                ):
+                    cap.release()
+                    new_cap = self._quick_reopen_camera()
+                    if new_cap is not None:
+                        with self._lock:
+                            self._cap = new_cap
+                        cap = new_cap
+                        read_failures = 0
+                        continue
                 if read_failures >= 30:
                     with self._lock:
                         self._running = False
@@ -868,6 +930,8 @@ class VisionEngine:
                 detections = sv.Detections.empty()
                 last_detections = detections
             frame_index += 1
+            with self._lock:
+                self._frame_index = frame_index
             infer_ms = (time.perf_counter() - infer_start) * 1000.0
             latency_value = (
                 0.85 * latency_value + 0.15 * infer_ms if latency_value else infer_ms
@@ -919,9 +983,6 @@ class VisionEngine:
             elif config.show_face:
                 annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
                 annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
-                annotated = draw_face_outlines(
-                    annotated, face_kp, color=(255, 107, 107)
-                )
             if config.show_hands:
                 annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
                 annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
