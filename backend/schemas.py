@@ -60,3 +60,6 @@ class StatusResponse(BaseModel):
     gemini: dict[str, Any] = Field(default_factory=dict)
     expressions: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
+    session_id: str = ""
+    frame_index: int = 0
+    uptime_sec: float = 0.0

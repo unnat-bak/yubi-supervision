@@ -4,6 +4,9 @@ const btnStop = document.getElementById("btn-stop");
 const statusPill = document.getElementById("status-pill");
 const statusLabel = document.getElementById("status-label");
 const errorMsg = document.getElementById("error-msg");
+const errorText = document.getElementById("error-text");
+const btnRetry = document.getElementById("btn-retry");
+const toast = document.getElementById("toast");
 const idleOverlay = document.getElementById("idle-overlay");
 const loadingOverlay = document.getElementById("loading-overlay");
 const loadingText = document.getElementById("loading-text");
@@ -38,6 +41,19 @@ const expressionNotes = document.getElementById("expression-notes");
 const expressionList = document.getElementById("expression-list");
 const expressionEmpty = document.getElementById("expression-empty");
 const expressionError = document.getElementById("expression-error");
+const hudOverlay = document.getElementById("hud-overlay");
+const pipelineRail = document.getElementById("pipeline-rail");
+const telemetryUtc = document.getElementById("telemetry-utc");
+const telemetrySession = document.getElementById("telemetry-session");
+const telemetryFrame = document.getElementById("telemetry-frame");
+const telemetryUptime = document.getElementById("telemetry-uptime");
+const feedList = document.getElementById("feed-list");
+const feedCount = document.getElementById("feed-count");
+const fpsSparkline = document.getElementById("fps-sparkline");
+const sessionLogActions = document.getElementById("session-log-actions");
+const sessionLogSummary = document.getElementById("session-log-summary");
+const btnDownloadLog = document.getElementById("btn-download-log");
+const btnDismissLog = document.getElementById("btn-dismiss-log");
 
 let pollTimer = null;
 let isLive = false;
@@ -49,17 +65,455 @@ let lastTracks = [];
 let lastGrouped = [];
 let activeThreshold = 0.35;
 let analysisEnabled = false;
+let toastTimer = null;
+let snapshotBusy = false;
+let clockTimer = null;
+let feedEntries = [];
+const seenFeedKeys = new Set();
+let lastGeminiState = null;
+let lastObjectCount = null;
+const fpsHistory = [];
+const MAX_FPS_HISTORY = 48;
+
+const fpsHistory = [];
+const MAX_FPS_HISTORY = 48;
+
+const LOG_TAG_LABELS = {
+  sys: "System",
+  v3: "YUBI v3.0",
+  alert: "Alert",
+  expr: "Expression",
+  obs: "Observation",
+  config: "Config",
+  capture: "Capture",
+  record: "Record",
+};
+
+let activeSession = null;
+let completedSession = null;
+
+function escapeMd(text) {
+  return String(text ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ").trim();
+}
+
+function formatLogTimestamp(iso) {
+  const d = new Date(iso);
+  return d.toISOString().replace("T", " ").slice(0, 19);
+}
+
+function formatDurationMs(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${h}h ${m}m ${s}s`;
+  }
+  if (m > 0) {
+    return `${m}m ${s}s`;
+  }
+  return `${s}s`;
+}
+
+function beginSession(sessionId) {
+  completedSession = null;
+  hideSessionLogActions();
+  activeSession = {
+    id: sessionId || "PENDING",
+    startedAt: new Date().toISOString(),
+    endedAt: null,
+    events: [],
+    config: {},
+    peakObjectCount: 0,
+    lastGeminiSummary: "",
+    snapshotCount: 0,
+    recorded: false,
+    finalStats: null,
+    finalTracks: [],
+    finalAlerts: [],
+    fpsSamples: [],
+    degraded: [],
+  };
+}
+
+function logSessionEvent(tag, message, extra = {}) {
+  if (!activeSession) return;
+  activeSession.events.push({
+    at: new Date().toISOString(),
+    tag,
+    message,
+    ...extra,
+  });
+}
+
+function finalizeSession(status) {
+  if (!activeSession) return;
+  activeSession.endedAt = new Date().toISOString();
+  if (status) {
+    if (status.session_id) {
+      activeSession.id = status.session_id;
+    }
+    activeSession.finalStats = {
+      frame_index: status.frame_index ?? 0,
+      uptime_sec: status.uptime_sec ?? 0,
+      object_count: status.object_count ?? 0,
+      pose_count: status.pose_count ?? 0,
+      face_count: status.face_count ?? 0,
+      hand_count: status.hand_count ?? 0,
+      fps: status.fps ?? 0,
+      latency_ms: status.latency_ms ?? 0,
+    };
+    activeSession.config = status.config || {};
+    activeSession.lastGeminiSummary = status.gemini?.scene_summary || "";
+    activeSession.finalTracks = status.tracks || [];
+    activeSession.finalAlerts = status.alerts || [];
+    activeSession.degraded = status.degraded || [];
+    activeSession.recorded = Boolean(status.recording);
+  }
+  logSessionEvent("sys", "Session terminated");
+  completedSession = activeSession;
+  activeSession = null;
+}
+
+function hideSessionLogActions() {
+  sessionLogActions.hidden = true;
+}
+
+function showSessionLogActions() {
+  if (!completedSession || completedSession.events.length < 2) return;
+  const duration = completedSession.endedAt && completedSession.startedAt
+    ? formatDurationMs(
+        new Date(completedSession.endedAt) - new Date(completedSession.startedAt)
+      )
+    : "—";
+  const events = completedSession.events.length;
+  sessionLogSummary.textContent = `${completedSession.id} · ${duration} · ${events} events logged`;
+  sessionLogActions.hidden = false;
+}
+
+function buildSessionMarkdown(session) {
+  const started = formatLogTimestamp(session.startedAt);
+  const ended = session.endedAt ? formatLogTimestamp(session.endedAt) : "—";
+  const duration =
+    session.endedAt && session.startedAt
+      ? formatDurationMs(
+          new Date(session.endedAt) - new Date(session.startedAt)
+        )
+      : "—";
+  const stats = session.finalStats || {};
+  const fpsSamples = session.fpsSamples || [];
+  const avgFps =
+    fpsSamples.length
+      ? (fpsSamples.reduce((a, b) => a + b, 0) / fpsSamples.length).toFixed(1)
+      : stats.fps
+        ? Number(stats.fps).toFixed(1)
+        : "—";
+
+  const config = session.config || {};
+  const layers = [
+    ["Objects", config.show_objects],
+    ["Pose / skeleton", config.show_pose],
+    ["Face", config.show_face],
+    ["Hands", config.show_hands],
+    ["Expressions", config.show_expressions],
+    ["YUBI v3.0", config.show_gemini],
+  ];
+
+  let md = `# YUBI Supervision — Session Log\n\n`;
+  md += `> Exported ${formatLogTimestamp(new Date().toISOString())} UTC\n\n`;
+  md += `## Session overview\n\n`;
+  md += `| Field | Value |\n| --- | --- |\n`;
+  md += `| Session ID | \`${session.id}\` |\n`;
+  md += `| Started (UTC) | ${started} |\n`;
+  md += `| Ended (UTC) | ${ended} |\n`;
+  md += `| Duration | ${duration} |\n`;
+  md += `| Frames processed | ${stats.frame_index ?? "—"} |\n`;
+  md += `| Peak tracked objects | ${session.peakObjectCount} |\n`;
+  md += `| Snapshots captured | ${session.snapshotCount} |\n`;
+  md += `| Video recorded | ${session.recorded ? "Yes" : "No"} |\n`;
+  if (session.degraded?.length) {
+    md += `| Degraded modules | ${session.degraded.join(", ")} |\n`;
+  }
+  md += `\n`;
+
+  md += `## Pipeline configuration\n\n`;
+  md += `| Layer | Status |\n| --- | --- |\n`;
+  for (const [name, on] of layers) {
+    md += `| ${name} | ${on ? "Enabled" : "Disabled"} |\n`;
+  }
+  const confPct =
+    config.confidence != null ? `${Math.round(config.confidence * 100)}%` : "—";
+  md += `| Confidence gate | ${confPct} |\n\n`;
+
+  md += `## Performance summary\n\n`;
+  md += `| Metric | Value |\n| --- | --- |\n`;
+  md += `| Average FPS (sampled) | ${avgFps} |\n`;
+  md += `| Final FPS | ${stats.fps ? Number(stats.fps).toFixed(1) : "—"} |\n`;
+  md += `| Final latency | ${stats.latency_ms ? `${Math.round(stats.latency_ms)} ms` : "—"} |\n`;
+  md += `| Final object count | ${stats.object_count ?? "—"} |\n`;
+  md += `| Pose / face / hands | ${stats.pose_count ?? 0} / ${stats.face_count ?? 0} / ${stats.hand_count ?? 0} |\n\n`;
+
+  if (session.lastGeminiSummary) {
+    md += `## YUBI v3.0 — final scene analysis\n\n`;
+    md += `${session.lastGeminiSummary}\n\n`;
+  }
+
+  if (session.finalTracks?.length) {
+    md += `## Final object registry\n\n`;
+    md += `| Label | Confidence | Tracker |\n| --- | --- | --- |\n`;
+    for (const track of session.finalTracks) {
+      const conf =
+        track.confidence != null ? `${Math.round(track.confidence * 100)}%` : "—";
+      const tid = track.tracker_id != null ? `#${track.tracker_id}` : "—";
+      md += `| ${escapeMd(track.label)} | ${conf} | ${tid} |\n`;
+    }
+    md += `\n`;
+  }
+
+  if (session.finalAlerts?.length) {
+    md += `## Watchlist alerts\n\n`;
+    md += `| Time | Label |\n| --- | --- |\n`;
+    for (const alert of session.finalAlerts) {
+      md += `| ${escapeMd(alert.time || "—")} | ${escapeMd(alert.label)} |\n`;
+    }
+    md += `\n`;
+  }
+
+  md += `## Event chronology\n\n`;
+  md += `| Time (UTC) | Type | Event |\n| --- | --- | --- |\n`;
+  for (const entry of session.events) {
+    const type = LOG_TAG_LABELS[entry.tag] || entry.tag;
+    let message = escapeMd(entry.message);
+    if (entry.summary) {
+      message += ` — ${escapeMd(entry.summary)}`;
+    }
+    md += `| ${formatLogTimestamp(entry.at)} | ${type} | ${message} |\n`;
+  }
+  md += `\n`;
+
+  md += `---\n\n`;
+  md += `*Generated by YUBI Supervision Node*\n`;
+  return md;
+}
+
+function downloadSessionLog() {
+  if (!completedSession) return;
+  const md = buildSessionMarkdown(completedSession);
+  const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+  const stamp = completedSession.endedAt
+    ? completedSession.endedAt.replace(/[:.]/g, "-").slice(0, 19)
+    : new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `yubi-session-${completedSession.id}-${stamp}.md`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+  showToast("Session log downloaded");
+}
+
+function formatUptime(seconds) {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  if (h > 0) {
+    return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  }
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function startTelemetryClock() {
+  if (clockTimer) return;
+  const tick = () => {
+    telemetryUtc.textContent = new Date().toISOString().slice(11, 19);
+  };
+  tick();
+  clockTimer = setInterval(tick, 1000);
+}
+
+function updateTelemetry(data) {
+  if (data.session_id) {
+    telemetrySession.textContent = data.session_id;
+    if (activeSession && activeSession.id === "PENDING") {
+      activeSession.id = data.session_id;
+    }
+  }
+  telemetryFrame.textContent = String(data.frame_index ?? 0);
+  telemetryUptime.textContent = formatUptime(data.uptime_sec ?? 0);
+}
+
+function updatePipelineRail(config, gemini, expressions) {
+  if (!config) return;
+  const map = {
+    objects: config.show_objects,
+    pose: config.show_pose,
+    face: config.show_face,
+    hands: config.show_hands,
+    expressions: config.show_expressions && Boolean(expressions?.enabled),
+    v3: config.show_gemini && gemini?.enabled,
+  };
+  for (const el of pipelineRail.querySelectorAll(".pipe-item")) {
+    const key = el.dataset.pipe;
+    const on = Boolean(map[key]);
+    el.classList.toggle("active", on);
+    const thinking =
+      key === "v3" && gemini?.state === "thinking" ||
+      key === "expressions" && expressions?.state === "thinking";
+    el.classList.toggle("thinking", thinking && on);
+  }
+}
+
+function pushFeed(tag, message, time) {
+  feedEntries.unshift({ tag, message, time });
+  if (feedEntries.length > 40) {
+    feedEntries.length = 40;
+  }
+  feedCount.textContent = String(feedEntries.length);
+  renderFeed();
+  logSessionEvent(tag, message);
+}
+
+function renderFeed() {
+  feedList.replaceChildren();
+  for (const entry of feedEntries) {
+    const li = document.createElement("li");
+    li.className = "feed-item";
+    const time = document.createElement("span");
+    time.className = "feed-time";
+    time.textContent = entry.time;
+    const tag = document.createElement("span");
+    tag.className = `feed-tag ${entry.tag}`;
+    tag.textContent = entry.tag;
+    const msg = document.createElement("span");
+    msg.className = "feed-msg";
+    msg.textContent = entry.message;
+    li.append(time, tag, msg);
+    feedList.appendChild(li);
+  }
+}
+
+function clearIntelFeed() {
+  feedEntries = [];
+  seenFeedKeys.clear();
+  lastGeminiState = null;
+  lastObjectCount = null;
+  fpsHistory.length = 0;
+  feedCount.textContent = "0";
+  renderFeed();
+  drawSparkline();
+}
+
+function ingestIntelFeed(data) {
+  const time = new Date().toTimeString().slice(0, 8);
+  const gemini = data.gemini;
+  const expressions = data.expressions;
+
+  if (gemini?.state && lastGeminiState !== null && gemini.state !== lastGeminiState) {
+    pushFeed("v3", `Pipeline ${gemini.state.toUpperCase()}`, time);
+  }
+  if (gemini?.state) {
+    lastGeminiState = gemini.state;
+  }
+
+  if (lastObjectCount !== null && data.object_count !== lastObjectCount) {
+    if (lastObjectCount === 0 || data.object_count === 0) {
+      const msg =
+        data.object_count === 0
+          ? "Track field cleared"
+          : `Tracks active (${data.object_count})`;
+      pushFeed("obs", msg, time);
+    }
+  }
+  lastObjectCount = data.object_count;
+
+  for (const alert of data.alerts || []) {
+    const key = `alert-${alert.ts}`;
+    if (seenFeedKeys.has(key)) continue;
+    seenFeedKeys.add(key);
+    pushFeed("alert", `${String(alert.label).toUpperCase()} in frame`, alert.time || time);
+  }
+
+  for (const event of expressions?.events || []) {
+    const key = `expr-${event.label}-${event.ts}`;
+    if (seenFeedKeys.has(key)) continue;
+    seenFeedKeys.add(key);
+    pushFeed("expr", event.label, time);
+  }
+}
+
+function drawSparkline() {
+  if (!fpsSparkline) return;
+  const ctx = fpsSparkline.getContext("2d");
+  const w = fpsSparkline.width;
+  const h = fpsSparkline.height;
+  ctx.clearRect(0, 0, w, h);
+  if (fpsHistory.length < 2) return;
+
+  const max = Math.max(...fpsHistory, 1);
+  ctx.strokeStyle = "rgba(142, 184, 176, 0.75)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  fpsHistory.forEach((fps, i) => {
+    const x = (i / (MAX_FPS_HISTORY - 1)) * (w - 4) + 2;
+    const y = h - 4 - (fps / max) * (h - 8);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function showToast(message, durationMs = 2200) {
+  toast.textContent = message;
+  toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.hidden = true;
+  }, durationMs);
+}
+
+function setLiveControls(enabled) {
+  btnStop.disabled = !enabled;
+  btnSnapshot.disabled = !enabled || snapshotBusy;
+  btnRecord.disabled = !enabled;
+}
+
+function applyLiveUI() {
+  const becomingLive = !isLive;
+  isLive = true;
+  if (becomingLive) {
+    beginSession(telemetrySession.textContent);
+  }
+  stream.src = `/api/stream?${Date.now()}`;
+  stream.classList.add("live");
+  btnStart.disabled = true;
+  setLiveControls(true);
+  statsBar.hidden = false;
+  detectionsPanel.hidden = false;
+  hudOverlay.hidden = false;
+  pipelineRail.hidden = false;
+  syncAnalysisPanelVisibility();
+  idleOverlay.classList.add("hidden");
+  statusPill.classList.remove("idle", "starting", "error");
+  statusPill.classList.add("live");
+  statusLabel.textContent = "LIVE";
+  setError(null);
+  if (becomingLive) {
+    pushFeed("sys", "Vision pipeline online", new Date().toTimeString().slice(0, 8));
+  }
+}
 
 function setError(message) {
   if (message) {
-    errorMsg.textContent = message;
+    errorText.textContent = message;
     errorMsg.hidden = false;
+    btnRetry.hidden = false;
     statusPill.classList.remove("idle", "live");
     statusPill.classList.add("error");
-    statusLabel.textContent = "Error";
+    statusLabel.textContent = "FAULT";
   } else {
     errorMsg.hidden = true;
-    errorMsg.textContent = "";
+    errorText.textContent = "";
+    btnRetry.hidden = true;
   }
 }
 
@@ -156,6 +610,23 @@ function updateStats(data) {
   statHands.textContent = String(data.hand_count ?? 0);
   statFps.textContent = data.fps ? data.fps.toFixed(1) : "—";
   statLatency.textContent = data.latency_ms ? String(Math.round(data.latency_ms)) : "—";
+  if (data.fps) {
+    fpsHistory.push(data.fps);
+    if (fpsHistory.length > MAX_FPS_HISTORY) fpsHistory.shift();
+    drawSparkline();
+  }
+  if (activeSession) {
+    if (data.fps) {
+      activeSession.fpsSamples.push(data.fps);
+      if (activeSession.fpsSamples.length > 180) {
+        activeSession.fpsSamples.shift();
+      }
+    }
+    if ((data.object_count ?? 0) > activeSession.peakObjectCount) {
+      activeSession.peakObjectCount = data.object_count;
+    }
+  }
+  updateTelemetry(data);
 }
 
 function beep() {
@@ -192,7 +663,11 @@ function handleAlerts(alerts) {
 function setRecordingUI(recording) {
   isRecording = recording;
   btnRecord.classList.toggle("recording", recording);
-  btnRecord.lastChild.textContent = recording ? "Stop Rec" : "Rec";
+  for (const node of btnRecord.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      node.textContent = recording ? "Stop" : "Record";
+    }
+  }
 }
 
 function updateDegraded(degraded) {
@@ -205,7 +680,23 @@ function updateDegraded(degraded) {
 }
 
 function syncAnalysisPanelVisibility() {
-  analysisPanel.hidden = !analysisEnabled && !isLive;
+  analysisPanel.hidden = !isLive;
+}
+
+function clearPanelContent() {
+  analysisState.textContent = "OFF";
+  analysisState.className = "panel-badge analysis-badge";
+  analysisSummary.textContent = "Semantic scene analysis when vision is live.";
+  analysisList.replaceChildren();
+  analysisEmpty.hidden = true;
+  analysisError.hidden = true;
+  expressionState.textContent = "OFF";
+  expressionState.className = "panel-badge expression-badge";
+  expressionNotes.textContent = "Micro-expression tracking and facial tessellation.";
+  expressionList.replaceChildren();
+  expressionEmpty.hidden = false;
+  expressionEmpty.textContent = "No micro-signals";
+  expressionError.hidden = true;
 }
 
 function renderAnalysis(analysis) {
@@ -215,11 +706,11 @@ function renderAnalysis(analysis) {
   syncAnalysisPanelVisibility();
 
   const stateLabels = {
-    disabled: "Off",
-    idle: "Idle",
-    thinking: "Analyzing",
-    ready: "Live",
-    error: "Error",
+    disabled: "OFF",
+    idle: "IDLE",
+    thinking: "RUN",
+    ready: "LIVE",
+    error: "FAULT",
   };
 
   analysisState.textContent = stateLabels[analysis.state] || analysis.state;
@@ -233,6 +724,7 @@ function renderAnalysis(analysis) {
     analysisList.replaceChildren();
     analysisEmpty.hidden = true;
     analysisError.hidden = true;
+    if (!isLive) analysisPanel.hidden = true;
     return;
   }
 
@@ -270,6 +762,8 @@ function renderAnalysis(analysis) {
     li.append(label, meta);
     analysisList.appendChild(li);
   }
+
+  syncAnalysisPanelVisibility();
 }
 
 function renderExpressions(expr) {
@@ -280,11 +774,11 @@ function renderExpressions(expr) {
   videoWrap.classList.toggle("expressions-live", showPanel);
 
   const stateLabels = {
-    disabled: "Off",
-    idle: "Idle",
-    thinking: "Analyzing",
-    ready: "Live",
-    error: "Error",
+    disabled: "OFF",
+    idle: "IDLE",
+    thinking: "RUN",
+    ready: "LIVE",
+    error: "FAULT",
   };
 
   expressionState.textContent = stateLabels[expr.state] || expr.state;
@@ -333,27 +827,31 @@ function renderExpressions(expr) {
 
 function setIdle() {
   isLive = false;
+  snapshotBusy = false;
   stream.removeAttribute("src");
   stream.classList.remove("live");
   btnStart.disabled = false;
-  btnStop.disabled = true;
-  btnSnapshot.disabled = true;
-  btnRecord.disabled = true;
+  setLiveControls(false);
   setRecordingUI(false);
   alertBanner.hidden = true;
   statusPill.classList.remove("live", "error");
   statusPill.classList.add("idle");
-  statusLabel.textContent = "Idle";
+  statusLabel.textContent = "STANDBY";
   idleOverlay.classList.remove("hidden");
   statsBar.hidden = true;
   detectionsPanel.hidden = true;
+  hudOverlay.hidden = true;
+  pipelineRail.hidden = true;
   expressionPanel.hidden = true;
+  analysisPanel.hidden = true;
   document.getElementById("video-wrap").classList.remove("expressions-live");
+  clearPanelContent();
   syncAnalysisPanelVisibility();
   loadingOverlay.hidden = true;
   renderDetections([], []);
   updateStats({});
   updateDegraded([]);
+  clearIntelFeed();
   setError(null);
   stopPolling();
 }
@@ -367,6 +865,38 @@ async function pushConfig(partial) {
     });
     const config = await res.json();
     syncLayerChips(config);
+    if (isLive) {
+      for (const [key, value] of Object.entries(partial)) {
+        if (key.startsWith("show_")) {
+          const layer = key.replace("show_", "").replace("_", " ");
+          logSessionEvent(
+            "config",
+            `${layer} ${value ? "enabled" : "disabled"}`
+          );
+        }
+        if (key === "confidence" && value != null) {
+          logSessionEvent(
+            "config",
+            `Confidence gate set to ${Math.round(Number(value) * 100)}%`
+          );
+        }
+      }
+    }
+    if (partial.show_expressions != null && !isLive) {
+      renderExpressions({
+        enabled: config.show_expressions,
+        state: config.show_expressions ? "idle" : "disabled",
+        events: [],
+        micro_cues: [],
+        structure_notes: config.show_expressions
+          ? "Expressions will activate when vision is live."
+          : "",
+        error: null,
+      });
+    }
+    if (isLive) {
+      refreshStatus();
+    }
   } catch {
     /* ignore */
   }
@@ -376,15 +906,34 @@ async function refreshStatus() {
   try {
     const res = await fetch("/api/status");
     const data = await res.json();
-    if (data.error) {
+    renderAnalysis(data.gemini);
+    renderExpressions(data.expressions);
+
+    if (data.state === "idle" && !isLive) {
+      analysisPanel.hidden = true;
+      expressionPanel.hidden = true;
+    }
+
+    if (data.state === "error" && data.error) {
+      if (isLive) {
+        finalizeSession(data);
+        setIdle();
+        showSessionLogActions();
+      }
       setError(data.error);
       return;
     }
-    renderAnalysis(data.gemini);
-    renderExpressions(data.expressions);
+
     if (data.state === "live") {
+      if (!isLive) {
+        applyLiveUI();
+        startPolling();
+      }
+      setError(null);
       updateStats(data);
       updateDegraded(data.degraded);
+      updatePipelineRail(data.config, data.gemini, data.expressions);
+      ingestIntelFeed(data);
       handleAlerts(data.alerts);
       if (data.recording !== isRecording) setRecordingUI(data.recording);
       if (data.config?.confidence != null) {
@@ -392,10 +941,19 @@ async function refreshStatus() {
       }
       renderDetections(data.tracks, data.objects);
       syncLayerChips(data.config);
+      if (activeSession && data.gemini?.scene_summary) {
+        const summary = data.gemini.scene_summary;
+        if (summary !== activeSession.lastGeminiSummary) {
+          if (activeSession.lastGeminiSummary) {
+            logSessionEvent("v3", "Scene analysis updated", { summary });
+          }
+          activeSession.lastGeminiSummary = summary;
+        }
+      }
     } else if (data.state === "starting") {
       statusPill.classList.remove("idle", "live", "error");
       statusPill.classList.add("starting");
-      statusLabel.textContent = "Starting";
+      statusLabel.textContent = "BOOTING";
       if (data.startup_message) {
         loadingText.textContent = data.startup_message;
       }
@@ -456,18 +1014,7 @@ async function startVision() {
 
     await waitUntilLive();
 
-    isLive = true;
-    stream.src = `/api/stream?${Date.now()}`;
-    stream.classList.add("live");
-    btnStop.disabled = false;
-    btnSnapshot.disabled = false;
-    btnRecord.disabled = false;
-    statsBar.hidden = false;
-    detectionsPanel.hidden = false;
-    syncAnalysisPanelVisibility();
-    statusPill.classList.remove("idle", "error");
-    statusPill.classList.add("live");
-    statusLabel.textContent = "Live";
+    applyLiveUI();
     startPolling();
     refreshStatus();
   } catch (err) {
@@ -480,18 +1027,30 @@ async function startVision() {
 
 async function stopVision() {
   if (!isLive) return;
+  let finalStatus = null;
   try {
+    const statusRes = await fetch("/api/status");
+    if (statusRes.ok) {
+      finalStatus = await statusRes.json();
+    }
     await fetch("/api/stop", { method: "POST" });
   } catch {
     /* still reset UI */
   }
+  finalizeSession(finalStatus);
   setIdle();
+  showSessionLogActions();
   refreshStatus();
 }
 
 async function takeSnapshot() {
-  if (!isLive) return;
+  if (!isLive || snapshotBusy) return;
+  snapshotBusy = true;
+  btnSnapshot.disabled = true;
+
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  let saved = 0;
+
   for (const [path, name] of [
     ["/api/snapshot", `snapshot-${stamp}.png`],
     ["/api/snapshot/json", `snapshot-${stamp}.json`],
@@ -505,10 +1064,37 @@ async function takeSnapshot() {
       a.download = name;
       a.click();
       URL.revokeObjectURL(a.href);
+      saved += 1;
     } catch {
       /* skip */
     }
   }
+
+  snapshotBusy = false;
+  if (isLive) {
+    btnSnapshot.disabled = false;
+  }
+  if (saved && activeSession) {
+    activeSession.snapshotCount += 1;
+    logSessionEvent(
+      "capture",
+      `Snapshot exported (${saved} file${saved > 1 ? "s" : ""})`
+    );
+  }
+  showToast(saved ? "Capture exported" : "Capture failed — retry");
+}
+
+async function retryVision() {
+  setError(null);
+  btnRetry.disabled = true;
+  try {
+    await fetch("/api/stop", { method: "POST" });
+  } catch {
+    /* still retry */
+  }
+  setIdle();
+  btnRetry.disabled = false;
+  await startVision();
 }
 
 async function toggleRecording() {
@@ -519,6 +1105,10 @@ async function toggleRecording() {
     if (res.ok) {
       const data = await res.json();
       setRecordingUI(data.recording);
+      logSessionEvent(
+        "record",
+        data.recording ? "Recording started" : "Recording stopped"
+      );
     }
   } catch {
     /* keep current state */
@@ -529,10 +1119,13 @@ btnStart.addEventListener("click", startVision);
 btnStop.addEventListener("click", stopVision);
 btnSnapshot.addEventListener("click", takeSnapshot);
 btnRecord.addEventListener("click", toggleRecording);
+btnRetry.addEventListener("click", retryVision);
+btnDownloadLog.addEventListener("click", downloadSessionLog);
+btnDismissLog.addEventListener("click", hideSessionLogActions);
 
 layerToggles.addEventListener("click", (e) => {
   const chip = e.target.closest(".layer-chip");
-  if (!chip || !isLive) return;
+  if (!chip) return;
   const layer = chip.dataset.layer;
   const next = !chip.classList.contains("active");
   chip.classList.toggle("active", next);
@@ -559,6 +1152,9 @@ confidenceSlider.addEventListener("input", applyThreshold);
 confidenceSlider.addEventListener("change", applyThreshold);
 
 document.addEventListener("keydown", (e) => {
+  if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+    return;
+  }
   if (e.code === "Space" && !isLive && !btnStart.disabled) {
     e.preventDefault();
     startVision();
@@ -567,6 +1163,11 @@ document.addEventListener("keydown", (e) => {
   if (!isLive) return;
   if (e.key === "Escape" || e.key === "q" || e.key === "Q") {
     stopVision();
+    return;
+  }
+  if ((e.key === "s" || e.key === "S") && !btnSnapshot.disabled) {
+    e.preventDefault();
+    takeSnapshot();
   }
 });
 
@@ -583,21 +1184,14 @@ async function hydrateFromServer() {
     if (config.confidence != null) {
       syncThresholdDisplay(config.confidence);
     }
+    if (status.session_id) {
+      telemetrySession.textContent = status.session_id;
+    }
     renderAnalysis(status.gemini);
+    renderExpressions(status.expressions);
 
     if (status.state === "live") {
-      isLive = true;
-      stream.src = `/api/stream?${Date.now()}`;
-      stream.classList.add("live");
-      btnStart.disabled = true;
-      btnStop.disabled = false;
-      statsBar.hidden = false;
-      detectionsPanel.hidden = false;
-      syncAnalysisPanelVisibility();
-      idleOverlay.classList.add("hidden");
-      statusPill.classList.remove("idle", "error");
-      statusPill.classList.add("live");
-      statusLabel.textContent = "Live";
+      applyLiveUI();
       startPolling();
       refreshStatus();
       return;
@@ -609,22 +1203,13 @@ async function hydrateFromServer() {
       idleOverlay.classList.add("hidden");
       statusPill.classList.remove("idle", "live", "error");
       statusPill.classList.add("starting");
-      statusLabel.textContent = "Starting";
+      statusLabel.textContent = "BOOTING";
       if (status.startup_message) {
         loadingText.textContent = status.startup_message;
       }
       try {
         await waitUntilLive();
-        isLive = true;
-        stream.src = `/api/stream?${Date.now()}`;
-        stream.classList.add("live");
-        btnStop.disabled = false;
-        statsBar.hidden = false;
-        detectionsPanel.hidden = false;
-        syncAnalysisPanelVisibility();
-        statusPill.classList.remove("starting", "error");
-        statusPill.classList.add("live");
-        statusLabel.textContent = "Live";
+        applyLiveUI();
         startPolling();
         refreshStatus();
       } catch (err) {
@@ -645,3 +1230,4 @@ async function hydrateFromServer() {
 }
 
 hydrateFromServer();
+startTelemetryClock();

@@ -246,7 +246,7 @@ def draw_expression_overlay(
     face_landmarks: list[list[Any]],
     guidance: ExpressionGuidance,
     micro_events: list[MicroEvent],
-    mesh_alpha: float = 0.72,
+    mesh_alpha: float = 0.38,
 ) -> np.ndarray:
     if not face_landmarks:
         return scene
@@ -267,7 +267,7 @@ def draw_expression_overlay(
                 overlay,
                 tuple(pts_i[start]),
                 tuple(pts_i[end]),
-                (210, 210, 210),
+                (168, 176, 184),
                 1,
                 cv2.LINE_AA,
             )
@@ -281,7 +281,7 @@ def draw_expression_overlay(
             if not box:
                 continue
             x1, y1, x2, y2 = _box_to_xyxy(box, width, height)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (180, 180, 180), 1, cv2.LINE_AA)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (150, 158, 168), 1, cv2.LINE_AA)
 
         if "eyebrow" in highlight_regions:
             brow_pts = []
@@ -296,7 +296,7 @@ def draw_expression_overlay(
                 if idx < len(pts_i):
                     brow_pts.append(pts_i[idx])
             for pt in brow_pts:
-                cv2.circle(overlay, tuple(pt), 3, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(overlay, tuple(pt), 2, (195, 200, 208), -1, cv2.LINE_AA)
 
         if "under-eye" in highlight_regions:
             eye_pts = []
@@ -311,7 +311,7 @@ def draw_expression_overlay(
                 if idx < len(pts_i):
                     eye_pts.append(pts_i[idx])
             for pt in eye_pts:
-                cv2.circle(overlay, tuple(pt), 2, (255, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(overlay, tuple(pt), 1, (195, 200, 208), -1, cv2.LINE_AA)
 
     return cv2.addWeighted(overlay, mesh_alpha, scene, 1.0 - mesh_alpha, 0)
 

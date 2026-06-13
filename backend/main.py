@@ -125,6 +125,9 @@ async def status() -> StatusResponse:
         },
         expressions=engine.get_expression_status(),
         error=stats.error,
+        session_id=stats.session_id,
+        frame_index=stats.frame_index,
+        uptime_sec=stats.uptime_sec,
     )
 
 

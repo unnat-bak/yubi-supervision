@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
       rel="stylesheet"
     />
     <link rel="stylesheet" href="/static/styles.css" />
@@ -15,96 +15,157 @@
   <body>
     <div id="video-wrap">
       <img id="stream" alt="" />
+      <div id="hud-overlay" class="hud-overlay" hidden>
+        <div class="hud-grid" aria-hidden="true"></div>
+        <div class="hud-bracket hud-bracket--tl" aria-hidden="true"></div>
+        <div class="hud-bracket hud-bracket--tr" aria-hidden="true"></div>
+        <div class="hud-bracket hud-bracket--bl" aria-hidden="true"></div>
+        <div class="hud-bracket hud-bracket--br" aria-hidden="true"></div>
+        <div class="hud-crosshair" aria-hidden="true"></div>
+        <div class="hud-scanline" aria-hidden="true"></div>
+      </div>
+
       <div id="idle-overlay" class="idle-overlay">
-        <div class="idle-content glass">
-          <p class="idle-title">YUBI Supervision</p>
-          <p class="idle-sub">Live object &amp; keypoint vision</p>
-          <p class="idle-hint">Press Start Vision or hit <kbd>Space</kbd></p>
+        <div class="idle-content intel-panel">
+          <p class="idle-mark">YUBI</p>
+          <p class="idle-title">Supervision Node</p>
+          <p class="idle-sub">Real-time object &amp; biometric vision pipeline</p>
+          <p class="idle-hint">Initialize feed · <kbd>Space</kbd></p>
+        </div>
+        <div id="session-log-actions" class="session-log-actions intel-panel" hidden>
+          <p class="session-log-title">Session complete</p>
+          <p id="session-log-summary" class="session-log-summary"></p>
+          <div class="session-log-buttons">
+            <button id="btn-download-log" type="button" class="btn btn-primary">
+              Download session log
+            </button>
+            <button id="btn-dismiss-log" type="button" class="btn btn-secondary btn-ghost">
+              Dismiss
+            </button>
+          </div>
         </div>
       </div>
       <div id="loading-overlay" class="loading-overlay" hidden>
         <div class="loader"></div>
-        <p id="loading-text">Loading models &amp; camera…</p>
+        <p id="loading-text">Booting inference stack…</p>
       </div>
 
-      <header class="glass top-bar">
-        <span class="brand">YUBI Supervision</span>
+      <header class="intel-panel command-bar">
+        <div class="brand-block">
+          <span class="brand-mark">YUBI</span>
+          <span class="brand-sub">SUPERVISION NODE</span>
+        </div>
+        <div class="telemetry-strip" id="telemetry-strip">
+          <span class="telemetry-item">
+            <span class="telemetry-k">UTC</span>
+            <span id="telemetry-utc" class="telemetry-v">--:--:--</span>
+          </span>
+          <span class="telemetry-item">
+            <span class="telemetry-k">SESSION</span>
+            <span id="telemetry-session" class="telemetry-v">--------</span>
+          </span>
+          <span class="telemetry-item">
+            <span class="telemetry-k">FRAME</span>
+            <span id="telemetry-frame" class="telemetry-v">0</span>
+          </span>
+          <span class="telemetry-item">
+            <span class="telemetry-k">UPTIME</span>
+            <span id="telemetry-uptime" class="telemetry-v">00:00</span>
+          </span>
+        </div>
+        <div id="pipeline-rail" class="pipeline-rail" hidden>
+          <span class="pipe-item" data-pipe="objects"><span class="pipe-dot"></span>OBS</span>
+          <span class="pipe-item" data-pipe="pose"><span class="pipe-dot"></span>SKEL</span>
+          <span class="pipe-item" data-pipe="face"><span class="pipe-dot"></span>FACE</span>
+          <span class="pipe-item" data-pipe="hands"><span class="pipe-dot"></span>HAND</span>
+          <span class="pipe-item" data-pipe="expressions"><span class="pipe-dot"></span>EXPR</span>
+          <span class="pipe-item" data-pipe="v3"><span class="pipe-dot"></span>V3.0</span>
+        </div>
         <span id="degraded-badge" class="degraded-badge" hidden></span>
         <div id="status-pill" class="status-pill idle">
           <span class="status-dot"></span>
-          <span id="status-label">Idle</span>
+          <span id="status-label">STANDBY</span>
         </div>
       </header>
 
-      <div id="stats-bar" class="stats-bar" hidden>
-        <div class="stat-card">
+      <div id="stats-bar" class="stats-rail" hidden>
+        <div class="stat-tile">
           <span class="stat-value" id="stat-objects">0</span>
-          <span class="stat-label">Objects</span>
+          <span class="stat-label">OBS</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-tile">
           <span class="stat-value" id="stat-pose">0</span>
-          <span class="stat-label">Pose</span>
+          <span class="stat-label">SKEL</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-tile">
           <span class="stat-value" id="stat-face">0</span>
-          <span class="stat-label">Face</span>
+          <span class="stat-label">FACE</span>
         </div>
-        <div class="stat-card">
+        <div class="stat-tile">
           <span class="stat-value" id="stat-hands">0</span>
-          <span class="stat-label">Hands</span>
+          <span class="stat-label">HAND</span>
         </div>
-        <div class="stat-card stat-fps">
+        <div class="stat-tile stat-perf">
           <span class="stat-value" id="stat-fps">—</span>
           <span class="stat-label">FPS</span>
         </div>
-        <div class="stat-card stat-fps">
+        <div class="stat-tile stat-perf">
           <span class="stat-value" id="stat-latency">—</span>
           <span class="stat-label">MS</span>
         </div>
+        <canvas id="fps-sparkline" class="fps-sparkline" width="96" height="32" aria-hidden="true"></canvas>
       </div>
 
-      <aside id="analysis-panel" class="glass analysis-panel" hidden>
-        <div class="panel-header">
-          <span class="panel-title">YUBI v3.0</span>
-          <span id="analysis-state" class="panel-badge analysis-badge">Off</span>
-        </div>
-        <p id="analysis-summary" class="analysis-summary">
-          Semantic scene analysis when vision is live.
-        </p>
-        <ul id="analysis-list" class="analysis-list"></ul>
-        <p id="analysis-empty" class="detections-empty" hidden>Waiting for analysis…</p>
-        <p id="analysis-error" class="analysis-error" hidden></p>
-      </aside>
+      <div id="right-rail" class="right-rail">
+        <aside id="expression-panel" class="intel-panel expression-panel" hidden>
+          <div class="panel-header">
+            <span class="panel-title">Biometric mesh</span>
+            <span id="expression-state" class="panel-badge expression-badge">OFF</span>
+          </div>
+          <p id="expression-notes" class="expression-notes">
+            Micro-expression tracking and facial tessellation.
+          </p>
+          <ul id="expression-list" class="expression-list"></ul>
+          <p id="expression-empty" class="detections-empty">No micro-signals</p>
+          <p id="expression-error" class="analysis-error" hidden></p>
+        </aside>
 
-      <aside id="expression-panel" class="glass expression-panel" hidden>
-        <div class="panel-header">
-          <span class="panel-title">Micro-expressions</span>
-          <span id="expression-state" class="panel-badge expression-badge">Off</span>
-        </div>
-        <p id="expression-notes" class="expression-notes">
-          Toggle Expressions for high-precision facial grid and micro-movement tracking.
-        </p>
-        <ul id="expression-list" class="expression-list"></ul>
-        <p id="expression-empty" class="detections-empty">No micro-movements detected</p>
-        <p id="expression-error" class="analysis-error" hidden></p>
-      </aside>
+        <aside id="analysis-panel" class="intel-panel analysis-panel" hidden>
+          <div class="panel-header">
+            <span class="panel-title">YUBI v3.0</span>
+            <span id="analysis-state" class="panel-badge analysis-badge">OFF</span>
+          </div>
+          <p id="analysis-summary" class="analysis-summary">
+            Semantic scene analysis when vision is live.
+          </p>
+          <ul id="analysis-list" class="analysis-list"></ul>
+          <p id="analysis-empty" class="detections-empty" hidden>Awaiting inference…</p>
+          <p id="analysis-error" class="analysis-error" hidden></p>
+        </aside>
+      </div>
 
-      <aside id="detections-panel" class="glass detections-panel" hidden>
+      <aside id="detections-panel" class="intel-panel detections-panel" hidden>
         <div class="panel-header">
-          <span class="panel-title">Detections</span>
+          <span class="panel-title">Object registry</span>
           <span id="object-total" class="panel-badge">0</span>
         </div>
         <label class="confidence-control">
-          <span>Threshold</span>
+          <span>Confidence gate</span>
           <span id="confidence-value">35%</span>
           <input id="confidence-slider" type="range" min="10" max="90" value="35" />
-          <span class="confidence-hint">Higher hides weaker detections (e.g. chair 57% vanishes above 57%)</span>
         </label>
         <ul id="detections-list" class="detections-list"></ul>
         <p id="detections-empty" class="detections-empty">No objects in frame</p>
+        <div id="intel-feed" class="intel-feed">
+          <div class="feed-header">
+            <span class="panel-title">Intel feed</span>
+            <span id="feed-count" class="panel-badge">0</span>
+          </div>
+          <ul id="feed-list" class="feed-list"></ul>
+        </div>
       </aside>
 
-      <footer class="glass bottom-bar">
+      <footer class="intel-panel command-footer">
         <div id="layer-toggles" class="layer-toggles">
           <button class="layer-chip active" data-layer="show_objects">Objects</button>
           <button class="layer-chip active" data-layer="show_pose">Pose</button>
@@ -114,17 +175,23 @@
           <button class="layer-chip active" data-layer="show_gemini">v3.0</button>
         </div>
         <div class="controls">
-          <button id="btn-start" class="btn btn-primary">Start Vision</button>
-          <button id="btn-stop" class="btn btn-secondary" disabled>Stop</button>
-          <button id="btn-snapshot" class="btn btn-secondary" disabled>Snapshot</button>
+          <button id="btn-start" class="btn btn-primary">Initialize</button>
+          <button id="btn-stop" class="btn btn-secondary" disabled>Terminate</button>
+          <button id="btn-snapshot" class="btn btn-secondary" disabled>Capture</button>
           <button id="btn-record" class="btn btn-secondary" disabled>
-            <span class="rec-dot"></span>Rec
+            <span class="rec-dot"></span>Record
           </button>
         </div>
-        <p class="shortcut-hint"><kbd>Q</kbd> / <kbd>Esc</kbd> stop · <kbd>Space</kbd> start</p>
+        <p class="shortcut-hint">
+          <kbd>Space</kbd> init · <kbd>S</kbd> capture · <kbd>Q</kbd> / <kbd>Esc</kbd> terminate
+        </p>
       </footer>
 
-      <p id="error-msg" class="error-msg" hidden></p>
+      <p id="error-msg" class="error-msg" hidden>
+        <span id="error-text"></span>
+        <button id="btn-retry" type="button" class="btn btn-secondary btn-retry" hidden>Retry</button>
+      </p>
+      <p id="toast" class="toast" hidden></p>
       <div id="alert-banner" class="alert-banner" hidden></div>
     </div>
     <script src="/static/app.js"></script>
