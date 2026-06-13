@@ -240,6 +240,20 @@ class TrackLabelCache:
                 del self._entries[tracker_id]
 
 
+def _iter_tracked_detection_indices(detections: Any) -> list[tuple[int, int]]:
+    """(detection_index, tracker_id) — safe when tracker_id is a numpy ndarray."""
+    if detections.is_empty() or detections.tracker_id is None:
+        return []
+    pairs: list[tuple[int, int]] = []
+    tracker_ids = detections.tracker_id
+    for index in range(len(detections)):
+        raw = tracker_ids[index]
+        if raw is None:
+            continue
+        pairs.append((index, int(raw)))
+    return pairs
+
+
 def collect_uncertain_hints(
     tracks: list[dict[str, Any]],
     detections: Any,
@@ -251,10 +265,7 @@ def collect_uncertain_hints(
     if detections.is_empty() or detections.xyxy is None:
         return hints
     track_ids = {int(t["tracker_id"]) for t in tracks if t.get("tracker_id") is not None}
-    for index, tracker_id in enumerate(detections.tracker_id or []):
-        if tracker_id is None:
-            continue
-        tid = int(tracker_id)
+    for index, tid in _iter_tracked_detection_indices(detections):
         if tid not in track_ids:
             continue
         conf = detections.confidence[index]
@@ -298,11 +309,9 @@ def reconcile_tracked_objects(
     fresh_insight = insight_is_fresh(insight, insight_max_age_sec)
     xyxy_by_tracker: dict[int, tuple[int, int, int, int]] = {}
     if not detections.is_empty() and detections.xyxy is not None:
-        for index, tracker_id in enumerate(detections.tracker_id or []):
-            if tracker_id is None:
-                continue
+        for index, tracker_id in _iter_tracked_detection_indices(detections):
             xyxy = tuple(int(v) for v in detections.xyxy[index])
-            xyxy_by_tracker[int(tracker_id)] = xyxy
+            xyxy_by_tracker[tracker_id] = xyxy
 
     active_ids = {
         int(t["tracker_id"]) for t in tracks if t.get("tracker_id") is not None
@@ -487,6 +496,24 @@ class GeminiEnricher:
         )
         if is_first or interval_ok:
             self._schedule_analysis()
+
+    def wants_new_analysis(self) -> bool:
+        """True when a new v3.0 scene pass should run (skip per-frame JPEG encode otherwise)."""
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._running:
+                return False
+            if self._analysis_in_flight:
+                return False
+            insight = self._insight
+        now = time.time()
+        is_first = insight.updated_at is None
+        interval_ok = (
+            insight.updated_at is not None
+            and now - insight.updated_at >= self._settings.gemini_interval_sec
+        )
+        return is_first or interval_ok
 
     def start(self) -> None:
         if not self.enabled:

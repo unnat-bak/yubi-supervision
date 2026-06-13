@@ -84,6 +84,9 @@ let toastTimer = null;
 let snapshotBusy = false;
 let logDownloadBusy = false;
 let clockTimer = null;
+let lastPipelineFrame = 0;
+let lastPipelineFrameAt = 0;
+let lastStreamReloadAt = 0;
 let feedEntries = [];
 const seenFeedKeys = new Set();
 let lastGeminiState = null;
@@ -451,6 +454,30 @@ function startTelemetryClock() {
   clockTimer = setInterval(tick, 1000);
 }
 
+function reconnectLiveStream(reason) {
+  if (!isLive) return;
+  const now = Date.now();
+  if (now - lastStreamReloadAt < 5000) return;
+  lastStreamReloadAt = now;
+  stream.src = `/api/stream?${now}`;
+  pushFeed("sys", reason || "Refreshing live feed", new Date().toTimeString().slice(0, 8));
+}
+
+function maybeRecoverLiveStream(frameIndex, fps) {
+  if (!isLive || frameIndex == null) return;
+  const now = Date.now();
+  if (frameIndex !== lastPipelineFrame) {
+    lastPipelineFrame = frameIndex;
+    lastPipelineFrameAt = now;
+    return;
+  }
+  // Only reload MJPEG when the pipeline is truly stalled (not just slow).
+  if (now - lastPipelineFrameAt < 6000) return;
+  if (fps != null && fps > 2) return;
+  reconnectLiveStream("Pipeline stalled — refreshing live feed");
+  lastPipelineFrameAt = now;
+}
+
 function updateTelemetry(data) {
   if (data.session_id) {
     telemetrySession.textContent = data.session_id;
@@ -460,6 +487,7 @@ function updateTelemetry(data) {
   }
   telemetryFrame.textContent = String(data.frame_index ?? 0);
   telemetryUptime.textContent = formatUptime(data.uptime_sec ?? 0);
+  maybeRecoverLiveStream(data.frame_index, data.fps);
 }
 
 function updatePipelineRail(config, gemini, expressions) {
@@ -605,6 +633,9 @@ function applyLiveUI() {
   }
   stream.src = `/api/stream?${Date.now()}`;
   stream.classList.add("live");
+  lastPipelineFrame = 0;
+  lastPipelineFrameAt = Date.now();
+  lastStreamReloadAt = 0;
   btnStart.disabled = true;
   setLiveControls(true);
   statsBar.hidden = false;

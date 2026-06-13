@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import queue
 import sys
 import threading
 import time
+import traceback
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
@@ -64,6 +66,56 @@ CAMERA_ERROR = (
     "Could not access the webcam. Grant camera permission in System Settings "
     "(Terminal or Python), close other apps using the camera, then click Retry."
 )
+
+
+class _CaptureWorker:
+    """Dedicated thread: always drains the camera so cap.read() never blocks inference."""
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self._cap = cap
+        self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self._running = False
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="yubi-capture", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        thread = self._thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._thread = None
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+
+    def _run(self) -> None:
+        while self._running:
+            ok, frame = self._cap.read()
+            if not ok:
+                time.sleep(0.002)
+                continue
+            if self._queue.full():
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._queue.put(frame)
+
+    def read_latest(self, timeout: float = 0.05) -> tuple[bool, np.ndarray | None]:
+        try:
+            return True, self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return False, None
+
+
 def ensure_models(models_dir: Path, timeout_sec: float = 60.0) -> None:
     models_dir.mkdir(parents=True, exist_ok=True)
     for filename, url in MODEL_URLS.items():
@@ -318,6 +370,7 @@ class VisionEngine:
         self._micro_tracker = MicroExpressionTracker()
         self._track_labels = TrackLabelCache(self._settings.gemini_label_cache_sec)
         self._cap: cv2.VideoCapture | None = None
+        self._capture_worker: _CaptureWorker | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
         self._hand: mp.tasks.vision.HandLandmarker | None = None
@@ -334,6 +387,8 @@ class VisionEngine:
         self._session_id = uuid.uuid4().hex[:8].upper()
         self._live_since: float | None = None
         self._frame_index = 0
+        self._loop_last_tick = 0.0
+        self._loop_error_streak = 0
         self._palette = sv.ColorPalette.from_hex([
             "#B8A48C",
             "#8FA89A",
@@ -574,6 +629,7 @@ class VisionEngine:
                 raise RuntimeError(
                     f"Could not open video source: {self._settings.camera_source}"
                 )
+            self._tune_capture(cap)
             return cap
 
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
@@ -606,7 +662,23 @@ class VisionEngine:
         cap = result["cap"]
         if cap is None:
             raise RuntimeError(CAMERA_ERROR)
+        self._tune_capture(cap)
         return cap
+
+    @staticmethod
+    def _tune_capture(cap: cv2.VideoCapture) -> None:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    def _start_capture_worker(self, cap: cv2.VideoCapture) -> None:
+        if self._capture_worker is not None:
+            self._capture_worker.stop()
+        self._capture_worker = _CaptureWorker(cap)
+        self._capture_worker.start()
+
+    def _stop_capture_worker(self) -> None:
+        if self._capture_worker is not None:
+            self._capture_worker.stop()
+            self._capture_worker = None
 
     def _quick_reopen_camera(self) -> cv2.VideoCapture | None:
         if self._settings.camera_source:
@@ -618,6 +690,7 @@ class VisionEngine:
             return None
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._settings.camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._settings.camera_height)
+        self._tune_capture(cap)
         return cap
 
     def start_async(self) -> None:
@@ -732,6 +805,7 @@ class VisionEngine:
                     self._release_models(cap, pose, face, hand)
                     return
                 self._cap = cap
+                self._start_capture_worker(cap)
                 self._pose = pose
                 self._face = face
                 self._hand = hand
@@ -742,6 +816,8 @@ class VisionEngine:
                 self._latest_jpeg = None
                 self._live_since = time.time()
                 self._frame_index = 0
+                self._loop_last_tick = time.time()
+                self._loop_error_streak = 0
                 self._stats = VisionStats(state="live", degraded=degraded)
 
             self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -775,6 +851,7 @@ class VisionEngine:
         self._expression.set_active(False)
         self._micro_tracker.reset()
         self._track_labels.reset()
+        self._stop_capture_worker()
 
         if self._bootstrap_thread and self._bootstrap_thread.is_alive():
             self._bootstrap_thread.join(timeout=3.0)
@@ -828,6 +905,7 @@ class VisionEngine:
             with self._lock:
                 if not self._running:
                     break
+                capture = self._capture_worker
                 cap = self._cap
                 pose = self._pose
                 face = self._face
@@ -843,11 +921,11 @@ class VisionEngine:
                     confidence=self._config.confidence,
                 )
 
-            if cap is None:
+            if capture is None or cap is None:
                 break
 
-            ok, frame = cap.read()
-            if not ok:
+            ok, frame = capture.read_latest()
+            if not ok or frame is None:
                 read_failures += 1
                 if self._settings.camera_source and read_failures < 30:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -860,9 +938,11 @@ class VisionEngine:
                     cap.release()
                     new_cap = self._quick_reopen_camera()
                     if new_cap is not None:
+                        self._start_capture_worker(new_cap)
                         with self._lock:
                             self._cap = new_cap
                         cap = new_cap
+                        capture = self._capture_worker
                         read_failures = 0
                         continue
                 if read_failures >= 30:
@@ -873,242 +953,265 @@ class VisionEngine:
                 time.sleep(0.03)
                 continue
 
-            read_failures = 0
-            frame = downscale_frame(frame, self._settings.processing_max_width)
-            height, width = frame.shape[:2]
+            try:
+                read_failures = 0
+                frame = downscale_frame(frame, self._settings.processing_max_width)
+                height, width = frame.shape[:2]
 
-            analysis_jpeg: bytes | None = None
-            if self._gemini.enabled:
-                analysis_width = analysis_width_for_frame(width, self._settings)
-                analysis_jpeg = encode_frame_jpeg(
-                    frame,
-                    max_width=analysis_width,
-                    quality=self._settings.gemini_jpeg_quality,
+                analysis_jpeg: bytes | None = None
+                needs_gemini_jpeg = (
+                    self._gemini.enabled
+                    and config.show_objects
+                    and config.show_gemini
+                    and self._gemini.wants_new_analysis()
+                )
+                if needs_gemini_jpeg:
+                    analysis_width = analysis_width_for_frame(width, self._settings)
+                    analysis_jpeg = encode_frame_jpeg(
+                        frame,
+                        max_width=analysis_width,
+                        quality=self._settings.gemini_jpeg_quality,
+                    )
+
+                yolo_confidence = effective_object_confidence(
+                    config.confidence,
+                    self._gemini.get_insight(),
+                    self._settings.gemini_box_max_age_sec,
                 )
 
-            yolo_confidence = effective_object_confidence(
-                config.confidence,
-                self._gemini.get_insight(),
-                self._settings.gemini_box_max_age_sec,
-            )
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
-            timestamp_ms += 33
-            infer_start = time.perf_counter()
-            need_face = config.show_face or config.show_expressions
-            pose_result = pose.detect_for_video(mp_image, timestamp_ms) if pose else None
-            face_result = (
-                face.detect_for_video(mp_image, timestamp_ms)
-                if face and need_face
-                else None
-            )
-            hand_result = hand.detect_for_video(mp_image, timestamp_ms) if hand else None
-
-            micro_events: list = []
-            if config.show_expressions and face_result and face_result.face_blendshapes:
-                for idx, shapes in enumerate(face_result.face_blendshapes):
-                    micro_events.extend(self._micro_tracker.update(idx, shapes))
-
-            if (
-                config.show_expressions
-                and face_result
-                and face_result.face_landmarks
-            ):
-                face_jpeg = crop_face_jpeg(
-                    frame,
-                    face_result.face_landmarks[0],
-                    self._settings.gemini_analysis_scale,
-                    self._settings.gemini_jpeg_quality,
+                timestamp_ms += 33
+                infer_start = time.perf_counter()
+                need_face = config.show_face or config.show_expressions
+                pose_result = pose.detect_for_video(mp_image, timestamp_ms) if pose else None
+                face_result = (
+                    face.detect_for_video(mp_image, timestamp_ms)
+                    if face and need_face
+                    else None
                 )
-                if face_jpeg:
-                    self._expression.push_face_frame(face_jpeg)
+                hand_result = hand.detect_for_video(mp_image, timestamp_ms) if hand else None
 
-            if config.show_objects and yolo is not None:
-                if frame_index % stride == 0:
-                    last_detections = self._detect_objects(
-                        frame, yolo, yolo_confidence
-                    )
-                detections = last_detections
-            else:
-                detections = sv.Detections.empty()
-                last_detections = detections
-            frame_index += 1
-            with self._lock:
-                self._frame_index = frame_index
-            infer_ms = (time.perf_counter() - infer_start) * 1000.0
-            latency_value = (
-                0.85 * latency_value + 0.15 * infer_ms if latency_value else infer_ms
-            )
+                micro_events: list = []
+                if config.show_expressions and face_result and face_result.face_blendshapes:
+                    for idx, shapes in enumerate(face_result.face_blendshapes):
+                        micro_events.extend(self._micro_tracker.update(idx, shapes))
 
-            resolution = (width, height)
-            pose_kp = (
-                sv.KeyPoints.from_mediapipe(pose_result, resolution)
-                if pose_result
-                else sv.KeyPoints.empty()
-            )
-            face_kp = (
-                sv.KeyPoints.from_mediapipe(face_result, resolution)
-                if face_result and config.show_face
-                else sv.KeyPoints.empty()
-            )
-            hand_kp = (
-                keypoints_from_hands(hand_result, resolution)
-                if hand_result
-                else sv.KeyPoints.empty()
-            )
+                if (
+                    config.show_expressions
+                    and face_result
+                    and face_result.face_landmarks
+                    and self._expression.wants_face_analysis()
+                ):
+                    face_jpeg = crop_face_jpeg(
+                        frame,
+                        face_result.face_landmarks[0],
+                        self._settings.gemini_analysis_scale,
+                        self._settings.gemini_jpeg_quality,
+                    )
+                    if face_jpeg:
+                        self._expression.push_face_frame(face_jpeg)
 
-            annotated = frame.copy()
-            track_items: list[dict[str, float | int | str | None | bool]] = []
-            display_detections = detections
-            box_labels: list[str] = []
-            gemini_insight = self._gemini.get_insight()
-
-            if config.show_objects and not detections.is_empty() and yolo is not None:
-                class_names = yolo.names
-                track_items = list_tracked_objects(detections, class_names)
-                if self._gemini.enabled and config.show_gemini:
-                    uncertain = collect_uncertain_hints(
-                        track_items,
-                        detections,
-                        self._settings.gemini_verify_below,
-                        width,
-                        height,
-                    )
-                    if analysis_jpeg:
-                        self._gemini.push_frame(analysis_jpeg, uncertain)
-                    gemini_insight = self._gemini.get_insight()
-                    track_items = reconcile_tracked_objects(
-                        track_items,
-                        detections,
-                        gemini_insight,
-                        width,
-                        height,
-                        self._track_labels,
-                        self._settings.gemini_verify_below,
-                        self._settings.gemini_box_max_age_sec,
-                        config.confidence,
-                    )
-                    track_items = merge_insight_into_tracks(
-                        track_items,
-                        detections,
-                        gemini_insight,
-                        width,
-                        height,
-                        self._settings.gemini_box_max_age_sec,
-                    )
-                    indices, box_labels = build_reconciled_detection_labels(
-                        track_items,
-                        detections,
-                        class_names,
-                        config.confidence,
-                    )
-                    display_detections = (
-                        detections[indices] if indices else sv.Detections.empty()
-                    )
+                if config.show_objects and yolo is not None:
+                    if frame_index % stride == 0:
+                        last_detections = self._detect_objects(
+                            frame, yolo, yolo_confidence
+                        )
+                    detections = last_detections
                 else:
-                    box_labels = build_detection_labels(detections, class_names)
+                    detections = sv.Detections.empty()
+                    last_detections = detections
+                frame_index += 1
+                with self._lock:
+                    self._frame_index = frame_index
+                infer_ms = (time.perf_counter() - infer_start) * 1000.0
+                latency_value = (
+                    0.85 * latency_value + 0.15 * infer_ms if latency_value else infer_ms
+                )
 
-            if config.show_objects and not display_detections.is_empty():
-                annotated = self._box_annotator.annotate(
-                    scene=annotated,
-                    detections=display_detections,
+                resolution = (width, height)
+                pose_kp = (
+                    sv.KeyPoints.from_mediapipe(pose_result, resolution)
+                    if pose_result
+                    else sv.KeyPoints.empty()
                 )
-                annotated = self._box_corner_annotator.annotate(
-                    scene=annotated,
-                    detections=display_detections,
+                face_kp = (
+                    sv.KeyPoints.from_mediapipe(face_result, resolution)
+                    if face_result and config.show_face
+                    else sv.KeyPoints.empty()
                 )
-                annotated = self._label_annotator.annotate(
-                    scene=annotated,
-                    detections=display_detections,
-                    labels=box_labels,
+                hand_kp = (
+                    keypoints_from_hands(hand_result, resolution)
+                    if hand_result
+                    else sv.KeyPoints.empty()
                 )
-            if config.show_pose:
-                annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
-            if config.show_expressions and face_result and face_result.face_landmarks:
-                guidance = self._expression.get_guidance()
-                annotated = draw_expression_overlay(
+
+                annotated = frame.copy()
+                track_items: list[dict[str, float | int | str | None | bool]] = []
+                display_detections = detections
+                box_labels: list[str] = []
+                gemini_insight = self._gemini.get_insight()
+
+                if config.show_objects and not detections.is_empty() and yolo is not None:
+                    class_names = yolo.names
+                    track_items = list_tracked_objects(detections, class_names)
+                    if self._gemini.enabled and config.show_gemini:
+                        if analysis_jpeg:
+                            uncertain = collect_uncertain_hints(
+                                track_items,
+                                detections,
+                                self._settings.gemini_verify_below,
+                                width,
+                                height,
+                            )
+                            self._gemini.push_frame(analysis_jpeg, uncertain)
+                        gemini_insight = self._gemini.get_insight()
+                        track_items = reconcile_tracked_objects(
+                            track_items,
+                            detections,
+                            gemini_insight,
+                            width,
+                            height,
+                            self._track_labels,
+                            self._settings.gemini_verify_below,
+                            self._settings.gemini_box_max_age_sec,
+                            config.confidence,
+                        )
+                        track_items = merge_insight_into_tracks(
+                            track_items,
+                            detections,
+                            gemini_insight,
+                            width,
+                            height,
+                            self._settings.gemini_box_max_age_sec,
+                        )
+                        indices, box_labels = build_reconciled_detection_labels(
+                            track_items,
+                            detections,
+                            class_names,
+                            config.confidence,
+                        )
+                        display_detections = (
+                            detections[indices] if indices else sv.Detections.empty()
+                        )
+                    else:
+                        box_labels = build_detection_labels(detections, class_names)
+
+                if config.show_objects and not display_detections.is_empty():
+                    annotated = self._box_annotator.annotate(
+                        scene=annotated,
+                        detections=display_detections,
+                    )
+                    annotated = self._box_corner_annotator.annotate(
+                        scene=annotated,
+                        detections=display_detections,
+                    )
+                    annotated = self._label_annotator.annotate(
+                        scene=annotated,
+                        detections=display_detections,
+                        labels=box_labels,
+                    )
+                if config.show_pose:
+                    annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
+                if config.show_expressions and face_result and face_result.face_landmarks:
+                    guidance = self._expression.get_guidance()
+                    annotated = draw_expression_overlay(
+                        annotated,
+                        face_result.face_landmarks,
+                        guidance,
+                        micro_events,
+                    )
+                elif config.show_face:
+                    annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
+                    annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
+                if config.show_hands:
+                    annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
+                    annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
+
+                if config.show_gemini and self._gemini.enabled:
+                    annotated = draw_gemini_boxes(
+                        annotated,
+                        gemini_insight,
+                        color=(220, 220, 220),
+                        max_age_sec=self._settings.gemini_box_max_age_sec,
+                    )
+
+                with self._lock:
+                    record_request = self._record_request
+                    self._record_request = None
+                if record_request == "start" and writer is None:
+                    recordings_dir = self._settings.recordings_dir
+                    recordings_dir.mkdir(parents=True, exist_ok=True)
+                    clip_name = datetime.now().strftime("clip-%Y%m%d-%H%M%S.mp4")
+                    writer = cv2.VideoWriter(
+                        str(recordings_dir / clip_name),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        max(fps_value, 10.0),
+                        (width, height),
+                    )
+                elif record_request == "stop" and writer is not None:
+                    writer.release()
+                    writer = None
+                if writer is not None:
+                    writer.write(annotated)
+
+                ok, jpeg = cv2.imencode(
+                    ".jpg",
                     annotated,
-                    face_result.face_landmarks,
-                    guidance,
-                    micro_events,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), self._settings.stream_jpeg_quality],
                 )
-            elif config.show_face:
-                annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
-                annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
-            if config.show_hands:
-                annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
-                annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
+                if not ok:
+                    continue
 
-            if config.show_gemini and self._gemini.enabled:
-                annotated = draw_gemini_boxes(
-                    annotated,
-                    gemini_insight,
-                    color=(220, 220, 220),
-                    max_age_sec=self._settings.gemini_box_max_age_sec,
-                )
+                jpeg_bytes = jpeg.tobytes()
 
-            with self._lock:
-                record_request = self._record_request
-                self._record_request = None
-            if record_request == "start" and writer is None:
-                recordings_dir = self._settings.recordings_dir
-                recordings_dir.mkdir(parents=True, exist_ok=True)
-                clip_name = datetime.now().strftime("clip-%Y%m%d-%H%M%S.mp4")
-                writer = cv2.VideoWriter(
-                    str(recordings_dir / clip_name),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
-                    max(fps_value, 10.0),
-                    (width, height),
-                )
-            elif record_request == "stop" and writer is not None:
-                writer.release()
-                writer = None
-            if writer is not None:
-                writer.write(annotated)
+                now = time.perf_counter()
+                elapsed = now - fps_clock
+                fps_clock = now
+                if elapsed > 0:
+                    fps_value = 0.85 * fps_value + 0.15 * (1.0 / elapsed)
 
-            ok, jpeg = cv2.imencode(
-                ".jpg",
-                annotated,
-                [int(cv2.IMWRITE_JPEG_QUALITY), self._settings.stream_jpeg_quality],
-            )
-            if not ok:
-                continue
+                class_names = yolo.names if yolo is not None else {}
+                object_summary = summarize_objects(detections, class_names)
+                if not track_items and not detections.is_empty() and yolo is not None:
+                    track_items = list_tracked_objects(detections, class_names)
+                alert_items = self._fire_alerts(object_summary)
+                with self._lock:
+                    self._latest_jpeg = jpeg_bytes
+                    self._stats = VisionStats(
+                        state="live",
+                        face_count=(
+                            len(face_result.face_landmarks)
+                            if face_result and face_result.face_landmarks
+                            else 0
+                        ),
+                        pose_count=len(pose_kp.xy) if config.show_pose else 0,
+                        hand_count=len(hand_kp.xy) if config.show_hands else 0,
+                        object_count=len(track_items),
+                        fps=round(fps_value, 1),
+                        latency_ms=round(latency_value, 1),
+                        objects=object_summary,
+                        tracks=track_items,
+                        degraded=degraded,
+                        recording=writer is not None,
+                        alerts=alert_items,
+                    )
 
-            jpeg_bytes = jpeg.tobytes()
-
-            now = time.perf_counter()
-            elapsed = now - fps_clock
-            fps_clock = now
-            if elapsed > 0:
-                fps_value = 0.85 * fps_value + 0.15 * (1.0 / elapsed)
-
-            class_names = yolo.names if yolo is not None else {}
-            object_summary = summarize_objects(detections, class_names)
-            if not track_items and not detections.is_empty() and yolo is not None:
-                track_items = list_tracked_objects(detections, class_names)
-            alert_items = self._fire_alerts(object_summary)
-            with self._lock:
-                self._latest_jpeg = jpeg_bytes
-                self._stats = VisionStats(
-                    state="live",
-                    face_count=(
-                        len(face_result.face_landmarks)
-                        if face_result and face_result.face_landmarks
-                        else 0
-                    ),
-                    pose_count=len(pose_kp.xy) if config.show_pose else 0,
-                    hand_count=len(hand_kp.xy) if config.show_hands else 0,
-                    object_count=len(track_items),
-                    fps=round(fps_value, 1),
-                    latency_ms=round(latency_value, 1),
-                    objects=object_summary,
-                    tracks=track_items,
-                    degraded=degraded,
-                    recording=writer is not None,
-                    alerts=alert_items,
-                )
+                self._loop_last_tick = time.time()
+                self._loop_error_streak = 0
+            except Exception:
+                self._loop_error_streak += 1
+                traceback.print_exc()
+                if self._loop_error_streak >= 25:
+                    with self._lock:
+                        self._running = False
+                        self._stats = VisionStats(
+                            state="error",
+                            error="Vision processing fault — check server logs",
+                        )
+                    break
+                time.sleep(0.05)
 
             time.sleep(0.001)
 

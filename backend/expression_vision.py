@@ -15,11 +15,10 @@ from mediapipe.tasks.python.vision.face_landmarker import (
 from backend.config import Settings
 from backend.gemini_vision import normalize_box_2d
 
-# MediaPipe face mesh edge groups for expression mode (high-precision grid).
+# Expression mesh edges — structural groups only (no full tessellation; too heavy per frame).
 EXPR_MESH_CONNECTIONS: tuple[tuple[int, int], ...] = tuple(
     (conn.start, conn.end)
     for group in (
-        FLC.FACE_LANDMARKS_TESSELATION,
         FLC.FACE_LANDMARKS_FACE_OVAL,
         FLC.FACE_LANDMARKS_LEFT_EYEBROW,
         FLC.FACE_LANDMARKS_RIGHT_EYEBROW,
@@ -283,13 +282,11 @@ def draw_expression_overlay(
     face_landmarks: list[list[Any]],
     guidance: ExpressionGuidance,
     micro_events: list[MicroEvent],
-    mesh_alpha: float = 0.24,
 ) -> np.ndarray:
     if not face_landmarks:
         return scene
 
     height, width = scene.shape[:2]
-    mesh_layer = scene.copy()
     highlight_regions: set[str] = {e.region for e in micro_events}
     brow_active = "eyebrow" in highlight_regions
     eye_active = "under-eye" in highlight_regions
@@ -303,7 +300,7 @@ def draw_expression_overlay(
             if start >= len(pts_i) or end >= len(pts_i):
                 continue
             cv2.line(
-                mesh_layer,
+                scene,
                 tuple(pts_i[start]),
                 tuple(pts_i[end]),
                 _TRACK_MESH,
@@ -320,38 +317,31 @@ def draw_expression_overlay(
             if not box:
                 continue
             x1, y1, x2, y2 = _box_to_xyxy(box, width, height)
-            cv2.rectangle(mesh_layer, (x1, y1), (x2, y2), _TRACK_BOX, 1, cv2.LINE_AA)
-
-    result = cv2.addWeighted(mesh_layer, mesh_alpha, scene, 1.0 - mesh_alpha, 0)
-
-    for landmarks in face_landmarks:
-        points = landmarks_to_points(landmarks, width, height)
-        points = refine_landmarks_with_guidance(points, guidance, width, height)
-        pts_i = points.astype(np.int32)
+            cv2.rectangle(scene, (x1, y1), (x2, y2), _TRACK_BOX, 1, cv2.LINE_AA)
 
         _draw_track_dots(
-            result,
+            scene,
             pts_i,
             EXPR_BROW_INDICES,
             2 if brow_active else 1,
             _TRACK_DOT_ACTIVE if brow_active else _TRACK_DOT_BASE,
         )
         _draw_track_dots(
-            result,
+            scene,
             pts_i,
             EXPR_EYE_INDICES,
             2 if eye_active else 1,
             _TRACK_DOT_ACTIVE if eye_active else _TRACK_DOT_BASE,
         )
         _draw_track_dots(
-            result,
+            scene,
             pts_i,
             EXPR_IRIS_INDICES,
             1,
             _TRACK_DOT_ACTIVE if eye_active else _TRACK_DOT_BASE,
         )
 
-    return result
+    return scene
 
 
 class ExpressionEnricher:
@@ -394,6 +384,22 @@ class ExpressionEnricher:
         )
         if is_first or interval_ok:
             self._schedule_analysis()
+
+    def wants_face_analysis(self) -> bool:
+        """True when a new v3.0 face pass should run (skip per-frame face crop otherwise)."""
+        with self._lock:
+            if not self._active:
+                return False
+            if self._analysis_in_flight:
+                return False
+            guidance = self._guidance
+        now = time.time()
+        is_first = guidance.updated_at is None
+        interval_ok = (
+            guidance.updated_at is not None
+            and now - guidance.updated_at >= self._settings.gemini_interval_sec
+        )
+        return is_first or interval_ok
 
     def get_guidance(self) -> ExpressionGuidance:
         with self._lock:

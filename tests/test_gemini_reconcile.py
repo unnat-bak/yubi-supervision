@@ -9,6 +9,7 @@ from backend.gemini_vision import (
     GeminiInsight,
     GeminiObject,
     TrackLabelCache,
+    collect_uncertain_hints,
     labels_match,
     reconcile_tracked_objects,
 )
@@ -101,3 +102,21 @@ def test_reconcile_corrects_label_from_v3_and_caches() -> None:
     )
     assert reconciled_again[0]["label"] == "shelf"
     assert reconciled_again[0]["source"] == "v3"
+
+
+def test_collect_uncertain_hints_with_multiple_tracks() -> None:
+    """Regression: numpy tracker_id arrays with len>1 break `tracker_id or []`."""
+    tracks = [
+        {"label": "toothbrush", "confidence": 0.18, "tracker_id": 3},
+        {"label": "person", "confidence": 0.92, "tracker_id": 1},
+    ]
+    detections = sv.Detections(
+        xyxy=np.array([[100, 100, 140, 140], [200, 200, 240, 240]], dtype=np.float32),
+        confidence=np.array([0.18, 0.92], dtype=np.float32),
+        class_id=np.array([79, 0], dtype=np.int32),
+        tracker_id=np.array([3, 1], dtype=np.int32),
+    )
+    hints = collect_uncertain_hints(tracks, detections, verify_below=0.45, width=640, height=480)
+    assert len(hints) == 1
+    assert hints[0]["tracker_id"] == 3
+    assert hints[0]["local_label"] == "toothbrush"
