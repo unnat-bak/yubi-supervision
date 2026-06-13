@@ -123,6 +123,7 @@ async def status() -> StatusResponse:
             "error": insight.error,
             "updated_at": insight.updated_at,
         },
+        expressions=engine.get_expression_status(),
         error=stats.error,
     )
 
@@ -171,7 +172,7 @@ async def mjpeg_stream():
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
                 )
-        await asyncio.sleep(0.033)
+        await asyncio.sleep(0.016)
 
 
 @app.get("/api/stream")

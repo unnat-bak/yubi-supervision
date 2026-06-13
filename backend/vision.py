@@ -16,7 +16,20 @@ import supervision as sv
 from ultralytics import YOLO
 
 from backend.config import Settings, get_settings
-from backend.gemini_vision import GeminiEnricher, GeminiInsight
+from backend.expression_vision import (
+    ExpressionEnricher,
+    MicroExpressionTracker,
+    crop_face_jpeg,
+    draw_expression_overlay,
+)
+from backend.gemini_vision import (
+    GeminiEnricher,
+    GeminiInsight,
+    analysis_width_for_frame,
+    effective_object_confidence,
+    merge_insight_into_tracks,
+    normalize_box_2d,
+)
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -165,22 +178,70 @@ def draw_face_outlines(
     return cv2.addWeighted(overlay, 0.85, scene, 0.15, 0)
 
 
+def encode_frame_jpeg(
+    frame: np.ndarray,
+    max_width: int | None = None,
+    quality: int = 85,
+) -> bytes | None:
+    target = frame
+    width = frame.shape[1]
+    if max_width and width > max_width:
+        height = frame.shape[0]
+        scale = max_width / width
+        target = cv2.resize(
+            frame,
+            (max_width, int(height * scale)),
+            interpolation=cv2.INTER_AREA,
+        )
+    ok, jpeg = cv2.imencode(
+        ".jpg", target, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+    )
+    return jpeg.tobytes() if ok else None
+
+
+def downscale_frame(frame: np.ndarray, max_width: int) -> np.ndarray:
+    width = frame.shape[1]
+    if width <= max_width:
+        return frame
+    height = frame.shape[0]
+    scale = max_width / width
+    return cv2.resize(
+        frame,
+        (max_width, int(height * scale)),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
 def draw_gemini_boxes(
-    scene: np.ndarray, insight: GeminiInsight, color: tuple[int, int, int]
+    scene: np.ndarray,
+    insight: GeminiInsight,
+    color: tuple[int, int, int],
+    max_age_sec: float,
 ) -> np.ndarray:
-    if insight.state != "ready" or not insight.objects:
+    if not insight.objects or insight.updated_at is None:
+        return scene
+    if time.time() - insight.updated_at > max_age_sec:
         return scene
 
     height, width = scene.shape[:2]
     annotated = scene.copy()
     for item in insight.objects:
-        ymin, xmin, ymax, xmax = item.box_2d
+        box = normalize_box_2d(item.box_2d)
+        if box is None:
+            continue
+        ymin, xmin, ymax, xmax = box
         x1 = int(xmin * width / 1000)
         y1 = int(ymin * height / 1000)
         x2 = int(xmax * width / 1000)
         y2 = int(ymax * height / 1000)
+        x1 = max(0, min(width - 1, x1))
+        y1 = max(0, min(height - 1, y1))
+        x2 = max(0, min(width - 1, x2))
+        y2 = max(0, min(height - 1, y2))
+        if x2 <= x1 or y2 <= y1:
+            continue
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-        label = f"✦ {item.label} {item.confidence:.0%}"
+        label = f"{item.label} {item.confidence:.0%}"
         (text_w, text_h), baseline = cv2.getTextSize(
             label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
         )
@@ -211,6 +272,7 @@ class VisionConfig:
     show_face: bool = True
     show_hands: bool = True
     show_gemini: bool = True
+    show_expressions: bool = False
     confidence: float = 0.35
 
 
@@ -244,6 +306,8 @@ class VisionEngine:
         self._stats = VisionStats()
         self._config = VisionConfig(confidence=self._settings.default_confidence)
         self._gemini = GeminiEnricher(self._settings)
+        self._expression = ExpressionEnricher(self._settings)
+        self._micro_tracker = MicroExpressionTracker()
         self._cap: cv2.VideoCapture | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
@@ -328,11 +392,35 @@ class VisionEngine:
                 show_face=self._config.show_face,
                 show_hands=self._config.show_hands,
                 show_gemini=self._config.show_gemini,
+                show_expressions=self._config.show_expressions,
                 confidence=self._config.confidence,
             )
 
     def get_gemini_insight(self) -> GeminiInsight:
         return self._gemini.get_insight()
+
+    def get_expression_status(self) -> dict[str, object]:
+        with self._lock:
+            enabled = self._config.show_expressions
+        guidance = self._expression.get_guidance()
+        events = self._micro_tracker.get_active_events()
+        return {
+            "enabled": enabled,
+            "state": guidance.state,
+            "events": [
+                {
+                    "label": e.label,
+                    "region": e.region,
+                    "intensity": e.intensity,
+                    "ts": e.ts,
+                }
+                for e in events
+            ],
+            "micro_cues": guidance.micro_cues,
+            "structure_notes": guidance.structure_notes,
+            "error": guidance.error,
+            "updated_at": guidance.updated_at,
+        }
 
     def gemini_enabled(self) -> bool:
         return self._gemini.enabled
@@ -342,12 +430,16 @@ class VisionEngine:
             for key, value in kwargs.items():
                 if hasattr(self._config, key) and value is not None:
                     setattr(self._config, key, value)
+            self._expression.set_active(self._config.show_expressions)
+            if not self._config.show_expressions:
+                self._micro_tracker.reset()
             return VisionConfig(
                 show_objects=self._config.show_objects,
                 show_pose=self._config.show_pose,
                 show_face=self._config.show_face,
                 show_hands=self._config.show_hands,
                 show_gemini=self._config.show_gemini,
+                show_expressions=self._config.show_expressions,
                 confidence=self._config.confidence,
             )
 
@@ -547,6 +639,7 @@ class VisionEngine:
                         ),
                         running_mode=running_mode,
                         num_faces=2,
+                        output_face_blendshapes=True,
                     )
                 )
             except Exception as exc:
@@ -601,6 +694,7 @@ class VisionEngine:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
             self._gemini.start()
+            self._expression.set_active(self._config.show_expressions)
         except Exception as exc:
             self._release_models(cap, pose, face, hand)
             with self._lock:
@@ -625,6 +719,8 @@ class VisionEngine:
             self._starting = False
 
         self._gemini.stop()
+        self._expression.set_active(False)
+        self._micro_tracker.reset()
 
         if self._bootstrap_thread and self._bootstrap_thread.is_alive():
             self._bootstrap_thread.join(timeout=3.0)
@@ -687,6 +783,7 @@ class VisionEngine:
                     show_face=self._config.show_face,
                     show_hands=self._config.show_hands,
                     show_gemini=self._config.show_gemini,
+                    show_expressions=self._config.show_expressions,
                     confidence=self._config.confidence,
                 )
 
@@ -709,20 +806,62 @@ class VisionEngine:
                 continue
 
             read_failures = 0
+            frame = downscale_frame(frame, self._settings.processing_max_width)
             height, width = frame.shape[:2]
+
+            if self._gemini.enabled:
+                analysis_width = analysis_width_for_frame(width, self._settings)
+                analysis_jpeg = encode_frame_jpeg(
+                    frame,
+                    max_width=analysis_width,
+                    quality=self._settings.gemini_jpeg_quality,
+                )
+                if analysis_jpeg:
+                    self._gemini.push_frame(analysis_jpeg)
+
+            yolo_confidence = effective_object_confidence(
+                config.confidence,
+                self._gemini.get_insight(),
+                self._settings.gemini_box_max_age_sec,
+            )
+
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
             timestamp_ms += 33
             infer_start = time.perf_counter()
+            need_face = config.show_face or config.show_expressions
             pose_result = pose.detect_for_video(mp_image, timestamp_ms) if pose else None
-            face_result = face.detect_for_video(mp_image, timestamp_ms) if face else None
+            face_result = (
+                face.detect_for_video(mp_image, timestamp_ms)
+                if face and need_face
+                else None
+            )
             hand_result = hand.detect_for_video(mp_image, timestamp_ms) if hand else None
+
+            micro_events: list = []
+            if config.show_expressions and face_result and face_result.face_blendshapes:
+                for idx, shapes in enumerate(face_result.face_blendshapes):
+                    micro_events.extend(self._micro_tracker.update(idx, shapes))
+
+            if (
+                config.show_expressions
+                and face_result
+                and face_result.face_landmarks
+            ):
+                face_jpeg = crop_face_jpeg(
+                    frame,
+                    face_result.face_landmarks[0],
+                    self._settings.gemini_analysis_scale,
+                    self._settings.gemini_jpeg_quality,
+                )
+                if face_jpeg:
+                    self._expression.push_face_frame(face_jpeg)
 
             if config.show_objects and yolo is not None:
                 if frame_index % stride == 0:
                     last_detections = self._detect_objects(
-                        frame, yolo, config.confidence
+                        frame, yolo, yolo_confidence
                     )
                 detections = last_detections
             else:
@@ -742,7 +881,7 @@ class VisionEngine:
             )
             face_kp = (
                 sv.KeyPoints.from_mediapipe(face_result, resolution)
-                if face_result
+                if face_result and config.show_face
                 else sv.KeyPoints.empty()
             )
             hand_kp = (
@@ -769,7 +908,15 @@ class VisionEngine:
                 )
             if config.show_pose:
                 annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
-            if config.show_face:
+            if config.show_expressions and face_result and face_result.face_landmarks:
+                guidance = self._expression.get_guidance()
+                annotated = draw_expression_overlay(
+                    annotated,
+                    face_result.face_landmarks,
+                    guidance,
+                    micro_events,
+                )
+            elif config.show_face:
                 annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
                 annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
                 annotated = draw_face_outlines(
@@ -782,7 +929,10 @@ class VisionEngine:
             gemini_insight = self._gemini.get_insight()
             if config.show_gemini and self._gemini.enabled:
                 annotated = draw_gemini_boxes(
-                    annotated, gemini_insight, color=(167, 139, 250)
+                    annotated,
+                    gemini_insight,
+                    color=(220, 220, 220),
+                    max_age_sec=self._settings.gemini_box_max_age_sec,
                 )
 
             with self._lock:
@@ -805,13 +955,14 @@ class VisionEngine:
                 writer.write(annotated)
 
             ok, jpeg = cv2.imencode(
-                ".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                ".jpg",
+                annotated,
+                [int(cv2.IMWRITE_JPEG_QUALITY), self._settings.stream_jpeg_quality],
             )
             if not ok:
                 continue
 
             jpeg_bytes = jpeg.tobytes()
-            self._gemini.push_frame(jpeg_bytes)
 
             now = time.perf_counter()
             elapsed = now - fps_clock
@@ -822,12 +973,25 @@ class VisionEngine:
             class_names = yolo.names if yolo is not None else {}
             object_summary = summarize_objects(detections, class_names)
             track_items = list_tracked_objects(detections, class_names)
+            if self._gemini.enabled:
+                track_items = merge_insight_into_tracks(
+                    track_items,
+                    detections,
+                    gemini_insight,
+                    width,
+                    height,
+                    self._settings.gemini_box_max_age_sec,
+                )
             alert_items = self._fire_alerts(object_summary)
             with self._lock:
                 self._latest_jpeg = jpeg_bytes
                 self._stats = VisionStats(
                     state="live",
-                    face_count=len(face_kp.xy) if config.show_face else 0,
+                    face_count=(
+                        len(face_result.face_landmarks)
+                        if face_result and face_result.face_landmarks
+                        else 0
+                    ),
                     pose_count=len(pose_kp.xy) if config.show_pose else 0,
                     hand_count=len(hand_kp.xy) if config.show_hands else 0,
                     object_count=len(detections),

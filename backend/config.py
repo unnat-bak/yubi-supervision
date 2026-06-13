@@ -51,8 +51,17 @@ class Settings(BaseSettings):
     gemini_api_key: str = ""
     gemini_enabled: bool = True
     gemini_model: str = "gemini-2.5-flash"
-    gemini_interval_sec: float = Field(default=4.0, ge=1.0, le=30.0)
-    gemini_max_objects: int = Field(default=12, ge=1, le=25)
+    gemini_interval_sec: float = Field(default=3.0, ge=2.0, le=30.0)
+    gemini_max_objects: int = Field(default=8, ge=1, le=25)
+    # Fraction of processing frame width sent to v3.0 (0.6 = 60% — cheaper, still accurate).
+    gemini_analysis_scale: float = Field(default=0.6, ge=0.3, le=1.0)
+    gemini_analysis_max_width: int = Field(default=0, ge=0, le=1280)
+    gemini_jpeg_quality: int = Field(default=70, ge=50, le=95)
+    gemini_box_max_age_sec: float = Field(default=6.0, ge=2.0, le=30.0)
+
+    # Downscale camera frames before inference (major FPS win on 1080p webcams).
+    processing_max_width: int = Field(default=1280, ge=640, le=1920)
+    stream_jpeg_quality: int = Field(default=80, ge=50, le=95)
 
     @property
     def gemini_active(self) -> bool:

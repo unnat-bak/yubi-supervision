@@ -13,6 +13,7 @@ class ConfigUpdate(BaseModel):
     show_face: Optional[bool] = None
     show_hands: Optional[bool] = None
     show_gemini: Optional[bool] = None
+    show_expressions: Optional[bool] = None
     confidence: Optional[float] = Field(default=None, ge=0.1, le=0.95)
 
 
@@ -57,4 +58,5 @@ class StatusResponse(BaseModel):
     startup_message: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
     gemini: dict[str, Any] = Field(default_factory=dict)
+    expressions: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
