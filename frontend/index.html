@@ -63,15 +63,29 @@
         </div>
       </div>
 
+      <aside id="gemini-panel" class="glass gemini-panel" hidden>
+        <div class="panel-header">
+          <span class="panel-title">Gemini Vision</span>
+          <span id="gemini-state" class="panel-badge gemini-badge">Off</span>
+        </div>
+        <p id="gemini-summary" class="gemini-summary">
+          Add GEMINI_API_KEY to .env for semantic scene analysis.
+        </p>
+        <ul id="gemini-list" class="gemini-list"></ul>
+        <p id="gemini-empty" class="detections-empty" hidden>Waiting for analysis…</p>
+        <p id="gemini-error" class="gemini-error" hidden></p>
+      </aside>
+
       <aside id="detections-panel" class="glass detections-panel" hidden>
         <div class="panel-header">
           <span class="panel-title">Detections</span>
           <span id="object-total" class="panel-badge">0</span>
         </div>
         <label class="confidence-control">
-          <span>Sensitivity</span>
-          <input id="confidence-slider" type="range" min="10" max="90" value="35" />
+          <span>Threshold</span>
           <span id="confidence-value">35%</span>
+          <input id="confidence-slider" type="range" min="10" max="90" value="35" />
+          <span class="confidence-hint">Higher hides weaker detections (e.g. chair 57% vanishes above 57%)</span>
         </label>
         <ul id="detections-list" class="detections-list"></ul>
         <p id="detections-empty" class="detections-empty">No objects in frame</p>
@@ -83,6 +97,7 @@
           <button class="layer-chip active" data-layer="show_pose">Pose</button>
           <button class="layer-chip active" data-layer="show_face">Face</button>
           <button class="layer-chip active" data-layer="show_hands">Hands</button>
+          <button class="layer-chip active" data-layer="show_gemini">Gemini</button>
         </div>
         <div class="controls">
           <button id="btn-start" class="btn btn-primary">Start Vision</button>

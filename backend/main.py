@@ -8,7 +8,13 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import get_settings
-from backend.schemas import ConfigUpdate, HealthResponse, StartResponse, StatusResponse
+from backend.schemas import (
+    ConfigUpdate,
+    GeminiStatusResponse,
+    HealthResponse,
+    StartResponse,
+    StatusResponse,
+)
 from backend.vision import VisionEngine
 
 settings = get_settings()
@@ -66,10 +72,27 @@ async def stop_vision() -> StartResponse:
     return StartResponse(state="idle")
 
 
+@app.get("/api/gemini", response_model=GeminiStatusResponse)
+async def gemini_status() -> GeminiStatusResponse:
+    insight = engine.get_gemini_insight()
+    return GeminiStatusResponse(
+        enabled=engine.gemini_enabled(),
+        state=insight.state,
+        scene_summary=insight.scene_summary,
+        objects=[
+            {"label": obj.label, "confidence": obj.confidence, "box_2d": obj.box_2d}
+            for obj in insight.objects
+        ],
+        error=insight.error,
+        updated_at=insight.updated_at,
+    )
+
+
 @app.get("/api/status", response_model=StatusResponse)
 async def status() -> StatusResponse:
     stats = engine.get_stats()
     config = engine.get_config()
+    insight = engine.get_gemini_insight()
     return StatusResponse(
         state=stats.state,
         face_count=stats.face_count,
@@ -85,6 +108,21 @@ async def status() -> StatusResponse:
         alerts=stats.alerts,
         startup_message=stats.startup_message,
         config=config.__dict__,
+        gemini={
+            "enabled": engine.gemini_enabled(),
+            "state": insight.state,
+            "scene_summary": insight.scene_summary,
+            "objects": [
+                {
+                    "label": obj.label,
+                    "confidence": obj.confidence,
+                    "box_2d": obj.box_2d,
+                }
+                for obj in insight.objects
+            ],
+            "error": insight.error,
+            "updated_at": insight.updated_at,
+        },
         error=stats.error,
     )
 

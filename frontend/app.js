@@ -26,6 +26,12 @@ const degradedBadge = document.getElementById("degraded-badge");
 const btnSnapshot = document.getElementById("btn-snapshot");
 const btnRecord = document.getElementById("btn-record");
 const alertBanner = document.getElementById("alert-banner");
+const geminiPanel = document.getElementById("gemini-panel");
+const geminiState = document.getElementById("gemini-state");
+const geminiSummary = document.getElementById("gemini-summary");
+const geminiList = document.getElementById("gemini-list");
+const geminiEmpty = document.getElementById("gemini-empty");
+const geminiError = document.getElementById("gemini-error");
 
 let pollTimer = null;
 let isLive = false;
@@ -33,6 +39,9 @@ let configDebounce = null;
 let isRecording = false;
 let lastAlertTs = 0;
 let alertHideTimer = null;
+let lastTracks = [];
+let lastGrouped = [];
+let activeThreshold = 0.35;
 
 function setError(message) {
   if (message) {
@@ -55,11 +64,36 @@ function syncLayerChips(config) {
   }
 }
 
-function renderDetections(tracks, grouped, objectCount) {
+function getThreshold() {
+  return Number(confidenceSlider.value) / 100;
+}
+
+function syncThresholdDisplay(confidence) {
+  if (confidence == null) return;
+  const pct = Math.round(confidence * 100);
+  confidenceSlider.value = String(pct);
+  confidenceValue.textContent = `${pct}%`;
+  activeThreshold = confidence;
+}
+
+function filterByThreshold(items) {
+  return items.filter((item) => item.confidence >= activeThreshold);
+}
+
+function renderDetections(tracks, grouped) {
+  if (tracks !== undefined) lastTracks = tracks || [];
+  if (grouped !== undefined) lastGrouped = grouped || [];
+
+  const source = lastTracks.length ? lastTracks : lastGrouped;
+  const items = filterByThreshold(source);
+
   detectionsList.replaceChildren();
-  objectTotal.textContent = String(objectCount);
-  const items = tracks?.length ? tracks : grouped || [];
+  objectTotal.textContent = String(items.length);
   detectionsEmpty.hidden = items.length > 0;
+  detectionsEmpty.textContent =
+    items.length === 0 && source.length > 0
+      ? "No objects above threshold"
+      : "No objects in frame";
 
   for (const item of items) {
     const li = document.createElement("li");
@@ -163,6 +197,65 @@ function updateDegraded(degraded) {
   }
 }
 
+function renderGemini(gemini) {
+  if (!gemini) return;
+
+  const stateLabels = {
+    disabled: "Off",
+    idle: "Idle",
+    thinking: "Thinking",
+    ready: "Live",
+    error: "Error",
+  };
+
+  geminiState.textContent = stateLabels[gemini.state] || gemini.state;
+  geminiState.className = "panel-badge gemini-badge";
+  if (gemini.state === "thinking") geminiState.classList.add("thinking");
+  if (gemini.state === "ready") geminiState.classList.add("ready");
+
+  if (!gemini.enabled) {
+    geminiSummary.textContent =
+      "Add GEMINI_API_KEY to .env for semantic scene analysis.";
+    geminiList.replaceChildren();
+    geminiEmpty.hidden = true;
+    geminiError.hidden = true;
+    return;
+  }
+
+  if (gemini.error) {
+    geminiError.textContent = gemini.error;
+    geminiError.hidden = false;
+  } else {
+    geminiError.hidden = true;
+    geminiError.textContent = "";
+  }
+
+  geminiSummary.textContent =
+    gemini.scene_summary ||
+    (gemini.state === "thinking"
+      ? "Analyzing scene with Gemini…"
+      : "Waiting for first Gemini analysis…");
+
+  geminiList.replaceChildren();
+  const items = gemini.objects || [];
+  geminiEmpty.hidden = items.length > 0 || gemini.state === "thinking";
+  geminiEmpty.textContent =
+    gemini.state === "thinking" ? "Analyzing…" : "No Gemini objects yet";
+
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = "gemini-item";
+    const label = document.createElement("span");
+    label.className = "gemini-item-label";
+    label.textContent = item.label;
+    const meta = document.createElement("span");
+    meta.className = "gemini-item-meta";
+    meta.textContent = `${Math.round(item.confidence * 100)}% confidence`;
+    li.append(label, meta);
+    geminiList.appendChild(li);
+  }
+}
+
 function setIdle() {
   isLive = false;
   stream.removeAttribute("src");
@@ -179,8 +272,9 @@ function setIdle() {
   idleOverlay.classList.remove("hidden");
   statsBar.hidden = true;
   detectionsPanel.hidden = true;
+  geminiPanel.hidden = true;
   loadingOverlay.hidden = true;
-  renderDetections([], [], 0);
+  renderDetections([], []);
   updateStats({});
   updateDegraded([]);
   setError(null);
@@ -214,13 +308,12 @@ async function refreshStatus() {
       updateDegraded(data.degraded);
       handleAlerts(data.alerts);
       if (data.recording !== isRecording) setRecordingUI(data.recording);
-      renderDetections(data.tracks, data.objects, data.object_count || 0);
-      syncLayerChips(data.config);
       if (data.config?.confidence != null) {
-        const pct = Math.round(data.config.confidence * 100);
-        confidenceSlider.value = String(pct);
-        confidenceValue.textContent = `${pct}%`;
+        syncThresholdDisplay(data.config.confidence);
       }
+      renderDetections(data.tracks, data.objects);
+      renderGemini(data.gemini);
+      syncLayerChips(data.config);
     } else if (data.state === "starting") {
       statusPill.classList.remove("idle", "live", "error");
       statusPill.classList.add("starting");
@@ -291,6 +384,7 @@ async function startVision() {
     btnRecord.disabled = false;
     statsBar.hidden = false;
     detectionsPanel.hidden = false;
+    geminiPanel.hidden = false;
     statusPill.classList.remove("idle", "error");
     statusPill.classList.add("live");
     statusLabel.textContent = "Live";
@@ -364,14 +458,24 @@ layerToggles.addEventListener("click", (e) => {
   pushConfig({ [layer]: next });
 });
 
-confidenceSlider.addEventListener("input", () => {
-  const pct = Number(confidenceSlider.value);
+function applyThreshold() {
+  activeThreshold = getThreshold();
+  const pct = Math.round(activeThreshold * 100);
   confidenceValue.textContent = `${pct}%`;
-  clearTimeout(configDebounce);
-  configDebounce = setTimeout(() => {
-    if (isLive) pushConfig({ confidence: pct / 100 });
-  }, 150);
-});
+  if (isLive) {
+    renderDetections();
+    statObjects.textContent = String(
+      filterByThreshold(lastTracks.length ? lastTracks : lastGrouped).length
+    );
+    clearTimeout(configDebounce);
+    configDebounce = setTimeout(() => {
+      pushConfig({ confidence: activeThreshold });
+    }, 80);
+  }
+}
+
+confidenceSlider.addEventListener("input", applyThreshold);
+confidenceSlider.addEventListener("change", applyThreshold);
 
 document.addEventListener("keydown", (e) => {
   if (e.code === "Space" && !isLive && !btnStart.disabled) {
@@ -385,14 +489,77 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-fetch("/api/config")
-  .then((r) => r.json())
-  .then((config) => {
+async function hydrateFromServer() {
+  try {
+    const [configRes, statusRes] = await Promise.all([
+      fetch("/api/config"),
+      fetch("/api/status"),
+    ]);
+    const config = await configRes.json();
+    const status = await statusRes.json();
+
     syncLayerChips(config);
     if (config.confidence != null) {
-      const pct = Math.round(config.confidence * 100);
-      confidenceSlider.value = String(pct);
-      confidenceValue.textContent = `${pct}%`;
+      syncThresholdDisplay(config.confidence);
     }
-  })
-  .catch(() => {});
+
+    if (status.state === "live") {
+      isLive = true;
+      stream.src = `/api/stream?${Date.now()}`;
+      stream.classList.add("live");
+      btnStart.disabled = true;
+      btnStop.disabled = false;
+      statsBar.hidden = false;
+      detectionsPanel.hidden = false;
+    geminiPanel.hidden = false;
+      idleOverlay.classList.add("hidden");
+      statusPill.classList.remove("idle", "error");
+      statusPill.classList.add("live");
+      statusLabel.textContent = "Live";
+      startPolling();
+      refreshStatus();
+      return;
+    }
+
+    if (status.state === "starting") {
+      btnStart.disabled = true;
+      loadingOverlay.hidden = false;
+      idleOverlay.classList.add("hidden");
+      statusPill.classList.remove("idle", "live", "error");
+      statusPill.classList.add("starting");
+      statusLabel.textContent = "Starting";
+      if (status.startup_message) {
+        loadingText.textContent = status.startup_message;
+      }
+      try {
+        await waitUntilLive();
+        isLive = true;
+        stream.src = `/api/stream?${Date.now()}`;
+        stream.classList.add("live");
+        btnStop.disabled = false;
+        statsBar.hidden = false;
+        detectionsPanel.hidden = false;
+    geminiPanel.hidden = false;
+        statusPill.classList.remove("starting", "error");
+        statusPill.classList.add("live");
+        statusLabel.textContent = "Live";
+        startPolling();
+        refreshStatus();
+      } catch (err) {
+        setIdle();
+        setError(err.message);
+      } finally {
+        loadingOverlay.hidden = true;
+      }
+      return;
+    }
+
+    if (status.state === "error" && status.error) {
+      setError(status.error);
+    }
+  } catch {
+    /* server may be offline on first paint */
+  }
+}
+
+hydrateFromServer();

@@ -6,6 +6,7 @@
   padding: 0;
 }
 
+/* display:flex on overlays overrides the native [hidden] attribute otherwise */
 [hidden] {
   display: none !important;
 }
@@ -25,6 +26,9 @@ body {
   width: 100vw;
   height: 100vh;
   background: radial-gradient(ellipse at 50% 30%, #141414 0%, #070707 70%);
+  --hud-inset: 20px;
+  --top-stack: 88px;
+  --bottom-stack: 196px;
 }
 
 #stream {
@@ -195,11 +199,12 @@ body {
 
 .stats-bar {
   position: absolute;
-  top: 88px;
-  right: 20px;
+  top: var(--top-stack);
+  right: calc(var(--hud-inset) + min(320px, calc(100vw - var(--hud-inset) * 2)) + 16px);
   display: flex;
   flex-direction: column;
   gap: 8px;
+  z-index: 11;
 }
 
 .stat-card {
@@ -239,14 +244,15 @@ body {
 
 .detections-panel {
   position: absolute;
-  left: 20px;
-  bottom: 120px;
-  width: min(300px, calc(100vw - 40px));
-  max-height: min(360px, 42vh);
+  left: var(--hud-inset);
+  top: var(--top-stack);
+  bottom: var(--bottom-stack);
+  width: min(300px, calc(100vw - var(--hud-inset) * 2));
   display: flex;
   flex-direction: column;
   padding: 16px;
   border-radius: 16px;
+  z-index: 12;
   animation: slideUp 0.35s ease;
 }
 
@@ -294,13 +300,20 @@ body {
 .confidence-control {
   display: grid;
   grid-template-columns: 1fr auto;
-  grid-template-rows: auto auto;
+  grid-template-rows: auto auto auto;
   gap: 4px 10px;
   margin-bottom: 12px;
   padding-bottom: 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.06);
   font-size: 0.72rem;
   color: rgba(255, 255, 255, 0.55);
+}
+
+.confidence-hint {
+  grid-column: 1 / -1;
+  font-size: 0.65rem;
+  color: rgba(255, 255, 255, 0.35);
+  line-height: 1.35;
 }
 
 .confidence-control input[type="range"] {
@@ -409,15 +422,16 @@ body {
 
 .bottom-bar {
   position: absolute;
-  bottom: 20px;
-  left: 20px;
-  right: 20px;
+  bottom: var(--hud-inset);
+  left: var(--hud-inset);
+  right: var(--hud-inset);
   padding: 14px 18px;
   border-radius: 16px;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 12px;
+  z-index: 20;
 }
 
 .layer-toggles {
@@ -465,6 +479,77 @@ body {
 .layer-chip[data-layer="show_hands"].active {
   border-color: rgba(77, 163, 255, 0.5);
   color: #4da3ff;
+}
+
+.layer-chip[data-layer="show_gemini"].active {
+  border-color: rgba(167, 139, 250, 0.55);
+  color: #a78bfa;
+}
+
+.gemini-panel {
+  position: absolute;
+  right: var(--hud-inset);
+  top: var(--top-stack);
+  bottom: var(--bottom-stack);
+  width: min(320px, calc(100vw - var(--hud-inset) * 2));
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+  border-radius: 16px;
+  z-index: 12;
+}
+
+.gemini-badge.thinking {
+  background: rgba(167, 139, 250, 0.18);
+  border-color: rgba(167, 139, 250, 0.45);
+  color: #c4b5fd;
+}
+
+.gemini-badge.ready {
+  background: rgba(167, 139, 250, 0.22);
+  border-color: rgba(167, 139, 250, 0.55);
+  color: #ddd6fe;
+}
+
+.gemini-summary {
+  font-size: 0.82rem;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.78);
+  margin-bottom: 12px;
+}
+
+.gemini-list {
+  list-style: none;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+}
+
+.gemini-item {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(167, 139, 250, 0.08);
+  border: 1px solid rgba(167, 139, 250, 0.22);
+}
+
+.gemini-item-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.gemini-item-meta {
+  font-size: 0.7rem;
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.gemini-error {
+  font-size: 0.75rem;
+  color: #fca5a5;
+  margin-top: 8px;
 }
 
 .controls {
@@ -564,7 +649,7 @@ kbd {
 
 .error-msg {
   position: absolute;
-  bottom: 130px;
+  bottom: calc(var(--bottom-stack) + 8px);
   left: 50%;
   transform: translateX(-50%);
   max-width: 480px;
@@ -579,12 +664,16 @@ kbd {
 }
 
 @media (max-width: 720px) {
+  #video-wrap {
+    --bottom-stack: 220px;
+  }
+
   .stats-bar {
     flex-direction: row;
     top: auto;
-    bottom: 200px;
-    right: 20px;
-    left: 20px;
+    bottom: calc(var(--bottom-stack) + 12px);
+    right: var(--hud-inset);
+    left: var(--hud-inset);
     justify-content: space-between;
   }
 
@@ -599,9 +688,14 @@ kbd {
   }
 
   .detections-panel {
-    bottom: 272px;
-    width: calc(100vw - 40px);
-    max-height: 24vh;
+    top: auto;
+    bottom: calc(var(--bottom-stack) + 72px);
+    width: calc(100vw - var(--hud-inset) * 2);
+    max-height: 32vh;
+  }
+
+  .gemini-panel {
+    display: none;
   }
 
   .degraded-badge {

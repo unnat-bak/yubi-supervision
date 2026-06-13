@@ -48,6 +48,16 @@ class Settings(BaseSettings):
     alert_webhook_url: Optional[str] = None  # noqa: UP045
     alert_cooldown_sec: int = Field(default=10, ge=1, le=3600)
 
+    gemini_api_key: str = ""
+    gemini_enabled: bool = True
+    gemini_model: str = "gemini-2.5-flash"
+    gemini_interval_sec: float = Field(default=4.0, ge=1.0, le=30.0)
+    gemini_max_objects: int = Field(default=12, ge=1, le=25)
+
+    @property
+    def gemini_active(self) -> bool:
+        return bool(self.gemini_api_key) and self.gemini_enabled
+
     @property
     def frontend_dir(self) -> Path:
         return ROOT_DIR / "frontend"

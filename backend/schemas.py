@@ -12,7 +12,23 @@ class ConfigUpdate(BaseModel):
     show_pose: Optional[bool] = None
     show_face: Optional[bool] = None
     show_hands: Optional[bool] = None
+    show_gemini: Optional[bool] = None
     confidence: Optional[float] = Field(default=None, ge=0.1, le=0.95)
+
+
+class GeminiObjectResponse(BaseModel):
+    label: str
+    confidence: float
+    box_2d: list[int]
+
+
+class GeminiStatusResponse(BaseModel):
+    enabled: bool
+    state: str
+    scene_summary: str = ""
+    objects: list[GeminiObjectResponse] = Field(default_factory=list)
+    error: Optional[str] = None
+    updated_at: Optional[float] = None
 
 
 class HealthResponse(BaseModel):
@@ -40,4 +56,5 @@ class StatusResponse(BaseModel):
     alerts: list[dict[str, Any]] = Field(default_factory=list)
     startup_message: Optional[str] = None
     config: dict[str, Any] = Field(default_factory=dict)
+    gemini: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
