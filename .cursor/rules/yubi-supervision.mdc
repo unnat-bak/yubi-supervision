@@ -5,8 +5,10 @@ alwaysApply: true
 
 Read `AGENTS.md` before making changes. For architecture or scaling decisions, also read `docs/ARCHITECTURE.md`.
 
-- Keep `backend/main.py` thin; vision logic stays in `backend/vision.py`.
-- Never block the FastAPI event loop with camera or model initialization — use `VisionEngine.start_async()`.
+- Keep `backend/main.py` thin; vision orchestration in `backend/vision.py`; YUBI v3.0 in `gemini_vision.py`; expressions in `expression_vision.py`; session reports in `session_report.py`.
+- Never block the FastAPI event loop with camera, model init, or GenAI — use `VisionEngine` background threads or worker threads for report streams.
 - Webcam capture is server-side OpenCV; macOS camera permission applies to the Python process.
-- Use env-based settings via `backend/config.py`; update `.env.example` when adding variables.
+- Use env-based settings via `backend/config.py`; update `.env.example` and docs when adding variables.
+- User-facing branding: **YUBI v3.0** (not vendor model names in UI or exports). Internal code may use `gemini_*` env vars.
+- After editing `frontend/app.js`, run `node --check frontend/app.js` — syntax errors break Initialize.
 - Do not commit `.venv/`, `.env`, `*.pt`, or `backend/models/*.task`.

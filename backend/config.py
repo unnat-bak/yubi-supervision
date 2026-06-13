@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     gemini_analysis_max_width: int = Field(default=0, ge=0, le=1280)
     gemini_jpeg_quality: int = Field(default=70, ge=50, le=95)
     gemini_box_max_age_sec: float = Field(default=6.0, ge=2.0, le=30.0)
+    # Local detections below this confidence are sent to v3.0 for verify/correct.
+    gemini_verify_below: float = Field(default=0.45, ge=0.1, le=0.9)
+    # Confirmed v3.0 labels stick on a tracker_id without re-querying the API.
+    gemini_label_cache_sec: float = Field(default=45.0, ge=5.0, le=300.0)
+    # YUBI v3.0 enrichment passes for post-session markdown (1–3).
+    session_report_passes: int = Field(default=3, ge=1, le=3)
 
     # Downscale camera frames before inference (major FPS win on 1080p webcams).
     processing_max_width: int = Field(default=1280, ge=640, le=1920)

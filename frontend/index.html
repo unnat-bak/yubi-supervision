@@ -37,12 +37,24 @@
           <p id="session-log-summary" class="session-log-summary"></p>
           <div class="session-log-buttons">
             <button id="btn-download-log" type="button" class="btn btn-primary">
-              Download session log
+              Download session report
             </button>
             <button id="btn-dismiss-log" type="button" class="btn btn-secondary btn-ghost">
               Dismiss
             </button>
           </div>
+        </div>
+      </div>
+      <div id="report-overlay" class="report-overlay" hidden>
+        <div class="intel-panel report-panel">
+          <div class="loader"></div>
+          <p class="report-title">Preparing session report</p>
+          <p id="report-status" class="report-status">Compiling session data…</p>
+          <ol id="report-pass-list" class="report-pass-list">
+            <li id="report-pass-1" class="report-pass-item">Pass 1 — Structure</li>
+            <li id="report-pass-2" class="report-pass-item">Pass 2 — Analysis</li>
+            <li id="report-pass-3" class="report-pass-item">Pass 3 — Finalize</li>
+          </ol>
         </div>
       </div>
       <div id="loading-overlay" class="loading-overlay" hidden>
@@ -119,12 +131,40 @@
       <div id="right-rail" class="right-rail">
         <aside id="expression-panel" class="intel-panel expression-panel" hidden>
           <div class="panel-header">
-            <span class="panel-title">Biometric mesh</span>
+            <span class="panel-title">Micro-expression tracking</span>
             <span id="expression-state" class="panel-badge expression-badge">OFF</span>
           </div>
+          <div class="expression-live-strip">
+            <span id="expression-pulse" class="expression-pulse" aria-hidden="true"></span>
+            <p id="expression-live-label" class="expression-live-label">Awaiting face lock</p>
+          </div>
+          <div class="expression-regions" aria-label="Region activity">
+            <div class="expr-region">
+              <div class="expr-region-head">
+                <span class="expr-region-label">Brow</span>
+                <span id="expr-region-brow-val" class="expr-region-val">—</span>
+              </div>
+              <div class="expr-region-bar">
+                <div id="expr-bar-brow" class="expr-region-fill"></div>
+              </div>
+            </div>
+            <div class="expr-region">
+              <div class="expr-region-head">
+                <span class="expr-region-label">Under-eye</span>
+                <span id="expr-region-eye-val" class="expr-region-val">—</span>
+              </div>
+              <div class="expr-region-bar">
+                <div id="expr-bar-eye" class="expr-region-fill"></div>
+              </div>
+            </div>
+          </div>
           <p id="expression-notes" class="expression-notes">
-            Micro-expression tracking and facial tessellation.
+            High-precision facial mesh for micro-movement detection.
           </p>
+          <div class="expression-feed-header">
+            <span class="panel-title">Live signals</span>
+            <span id="expression-signal-count" class="panel-badge">0</span>
+          </div>
           <ul id="expression-list" class="expression-list"></ul>
           <p id="expression-empty" class="detections-empty">No micro-signals</p>
           <p id="expression-error" class="analysis-error" hidden></p>
@@ -149,6 +189,19 @@
           <span class="panel-title">Object registry</span>
           <span id="object-total" class="panel-badge">0</span>
         </div>
+        <section class="layers-section" aria-label="Pipeline layers">
+          <div class="panel-header panel-header--compact">
+            <span class="panel-title">Pipeline layers</span>
+          </div>
+          <div id="layer-toggles" class="layer-toggles layer-grid">
+            <button class="layer-chip active" data-layer="show_objects" type="button">Objects</button>
+            <button class="layer-chip active" data-layer="show_pose" type="button">Pose</button>
+            <button class="layer-chip active" data-layer="show_face" type="button">Face</button>
+            <button class="layer-chip active" data-layer="show_hands" type="button">Hands</button>
+            <button class="layer-chip" data-layer="show_expressions" type="button">Expressions</button>
+            <button class="layer-chip active" data-layer="show_gemini" type="button">YUBI v3.0</button>
+          </div>
+        </section>
         <label class="confidence-control">
           <span>Confidence gate</span>
           <span id="confidence-value">35%</span>
@@ -166,14 +219,6 @@
       </aside>
 
       <footer class="intel-panel command-footer">
-        <div id="layer-toggles" class="layer-toggles">
-          <button class="layer-chip active" data-layer="show_objects">Objects</button>
-          <button class="layer-chip active" data-layer="show_pose">Pose</button>
-          <button class="layer-chip active" data-layer="show_face">Face</button>
-          <button class="layer-chip active" data-layer="show_hands">Hands</button>
-          <button class="layer-chip" data-layer="show_expressions">Expressions</button>
-          <button class="layer-chip active" data-layer="show_gemini">v3.0</button>
-        </div>
         <div class="controls">
           <button id="btn-start" class="btn btn-primary">Initialize</button>
           <button id="btn-stop" class="btn btn-secondary" disabled>Terminate</button>

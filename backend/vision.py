@@ -26,10 +26,14 @@ from backend.expression_vision import (
 from backend.gemini_vision import (
     GeminiEnricher,
     GeminiInsight,
+    TrackLabelCache,
     analysis_width_for_frame,
+    build_reconciled_detection_labels,
+    collect_uncertain_hints,
     effective_object_confidence,
     merge_insight_into_tracks,
     normalize_box_2d,
+    reconcile_tracked_objects,
 )
 
 MODEL_URLS = {
@@ -312,6 +316,7 @@ class VisionEngine:
         self._gemini = GeminiEnricher(self._settings)
         self._expression = ExpressionEnricher(self._settings)
         self._micro_tracker = MicroExpressionTracker()
+        self._track_labels = TrackLabelCache(self._settings.gemini_label_cache_sec)
         self._cap: cv2.VideoCapture | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
@@ -769,6 +774,7 @@ class VisionEngine:
         self._gemini.stop()
         self._expression.set_active(False)
         self._micro_tracker.reset()
+        self._track_labels.reset()
 
         if self._bootstrap_thread and self._bootstrap_thread.is_alive():
             self._bootstrap_thread.join(timeout=3.0)
@@ -871,6 +877,7 @@ class VisionEngine:
             frame = downscale_frame(frame, self._settings.processing_max_width)
             height, width = frame.shape[:2]
 
+            analysis_jpeg: bytes | None = None
             if self._gemini.enabled:
                 analysis_width = analysis_width_for_frame(width, self._settings)
                 analysis_jpeg = encode_frame_jpeg(
@@ -878,8 +885,6 @@ class VisionEngine:
                     max_width=analysis_width,
                     quality=self._settings.gemini_jpeg_quality,
                 )
-                if analysis_jpeg:
-                    self._gemini.push_frame(analysis_jpeg)
 
             yolo_confidence = effective_object_confidence(
                 config.confidence,
@@ -955,20 +960,69 @@ class VisionEngine:
             )
 
             annotated = frame.copy()
-            if config.show_objects and not detections.is_empty():
-                labels = build_detection_labels(detections, yolo.names)
+            track_items: list[dict[str, float | int | str | None | bool]] = []
+            display_detections = detections
+            box_labels: list[str] = []
+            gemini_insight = self._gemini.get_insight()
+
+            if config.show_objects and not detections.is_empty() and yolo is not None:
+                class_names = yolo.names
+                track_items = list_tracked_objects(detections, class_names)
+                if self._gemini.enabled and config.show_gemini:
+                    uncertain = collect_uncertain_hints(
+                        track_items,
+                        detections,
+                        self._settings.gemini_verify_below,
+                        width,
+                        height,
+                    )
+                    if analysis_jpeg:
+                        self._gemini.push_frame(analysis_jpeg, uncertain)
+                    gemini_insight = self._gemini.get_insight()
+                    track_items = reconcile_tracked_objects(
+                        track_items,
+                        detections,
+                        gemini_insight,
+                        width,
+                        height,
+                        self._track_labels,
+                        self._settings.gemini_verify_below,
+                        self._settings.gemini_box_max_age_sec,
+                        config.confidence,
+                    )
+                    track_items = merge_insight_into_tracks(
+                        track_items,
+                        detections,
+                        gemini_insight,
+                        width,
+                        height,
+                        self._settings.gemini_box_max_age_sec,
+                    )
+                    indices, box_labels = build_reconciled_detection_labels(
+                        track_items,
+                        detections,
+                        class_names,
+                        config.confidence,
+                    )
+                    display_detections = (
+                        detections[indices] if indices else sv.Detections.empty()
+                    )
+                else:
+                    box_labels = build_detection_labels(detections, class_names)
+
+            if config.show_objects and not display_detections.is_empty():
                 annotated = self._box_annotator.annotate(
                     scene=annotated,
-                    detections=detections,
+                    detections=display_detections,
                 )
                 annotated = self._box_corner_annotator.annotate(
                     scene=annotated,
-                    detections=detections,
+                    detections=display_detections,
                 )
                 annotated = self._label_annotator.annotate(
                     scene=annotated,
-                    detections=detections,
-                    labels=labels,
+                    detections=display_detections,
+                    labels=box_labels,
                 )
             if config.show_pose:
                 annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
@@ -987,7 +1041,6 @@ class VisionEngine:
                 annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
                 annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
 
-            gemini_insight = self._gemini.get_insight()
             if config.show_gemini and self._gemini.enabled:
                 annotated = draw_gemini_boxes(
                     annotated,
@@ -1033,16 +1086,8 @@ class VisionEngine:
 
             class_names = yolo.names if yolo is not None else {}
             object_summary = summarize_objects(detections, class_names)
-            track_items = list_tracked_objects(detections, class_names)
-            if self._gemini.enabled:
-                track_items = merge_insight_into_tracks(
-                    track_items,
-                    detections,
-                    gemini_insight,
-                    width,
-                    height,
-                    self._settings.gemini_box_max_age_sec,
-                )
+            if not track_items and not detections.is_empty() and yolo is not None:
+                track_items = list_tracked_objects(detections, class_names)
             alert_items = self._fire_alerts(object_summary)
             with self._lock:
                 self._latest_jpeg = jpeg_bytes
@@ -1055,7 +1100,7 @@ class VisionEngine:
                     ),
                     pose_count=len(pose_kp.xy) if config.show_pose else 0,
                     hand_count=len(hand_kp.xy) if config.show_hands else 0,
-                    object_count=len(detections),
+                    object_count=len(track_items),
                     fps=round(fps_value, 1),
                     latency_ms=round(latency_value, 1),
                     objects=object_summary,
