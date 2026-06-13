@@ -16,6 +16,7 @@ import supervision as sv
 from ultralytics import YOLO
 
 from backend.config import Settings, get_settings
+from backend.gemini_vision import GeminiEnricher, GeminiInsight
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -149,12 +150,67 @@ def build_detection_labels(
     return labels
 
 
+def draw_face_outlines(
+    scene: np.ndarray, face_kp: sv.KeyPoints, color: tuple[int, int, int]
+) -> np.ndarray:
+    if face_kp.is_empty():
+        return scene
+    overlay = scene.copy()
+    for face in face_kp.xy:
+        points = face.astype(np.int32)
+        if len(points) < 3:
+            continue
+        hull = cv2.convexHull(points)
+        cv2.polylines(overlay, [hull], True, color, 3, cv2.LINE_AA)
+    return cv2.addWeighted(overlay, 0.85, scene, 0.15, 0)
+
+
+def draw_gemini_boxes(
+    scene: np.ndarray, insight: GeminiInsight, color: tuple[int, int, int]
+) -> np.ndarray:
+    if insight.state != "ready" or not insight.objects:
+        return scene
+
+    height, width = scene.shape[:2]
+    annotated = scene.copy()
+    for item in insight.objects:
+        ymin, xmin, ymax, xmax = item.box_2d
+        x1 = int(xmin * width / 1000)
+        y1 = int(ymin * height / 1000)
+        x2 = int(xmax * width / 1000)
+        y2 = int(ymax * height / 1000)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+        label = f"✦ {item.label} {item.confidence:.0%}"
+        (text_w, text_h), baseline = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+        )
+        cv2.rectangle(
+            annotated,
+            (x1, max(0, y1 - text_h - baseline - 8)),
+            (x1 + text_w + 10, y1),
+            color,
+            -1,
+        )
+        cv2.putText(
+            annotated,
+            label,
+            (x1 + 5, y1 - 6),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return annotated
+
+
 @dataclass
 class VisionConfig:
     show_objects: bool = True
     show_pose: bool = True
     show_face: bool = True
     show_hands: bool = True
+    show_gemini: bool = True
     confidence: float = 0.35
 
 
@@ -187,6 +243,7 @@ class VisionEngine:
         self._latest_jpeg: bytes | None = None
         self._stats = VisionStats()
         self._config = VisionConfig(confidence=self._settings.default_confidence)
+        self._gemini = GeminiEnricher(self._settings)
         self._cap: cv2.VideoCapture | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
@@ -206,14 +263,24 @@ class VisionEngine:
             "#F472B6", "#2DD4BF", "#FB923C", "#818CF8", "#E879F9",
         ])
         self._pose_edge = sv.EdgeAnnotator(color=sv.Color.GREEN, thickness=2)
-        self._face_edge = sv.EdgeAnnotator(color=sv.Color.from_hex("#FF6B6B"), thickness=1)
+        self._face_edge = sv.EdgeAnnotator(
+            color=sv.Color.from_hex("#FF6B6B"), thickness=1
+        )
+        self._face_vertex = sv.VertexAnnotator(
+            color=sv.Color.from_hex("#FF6B6B"), radius=2
+        )
         self._hand_edge = sv.EdgeAnnotator(
             color=sv.Color.from_hex("#4DA3FF"), thickness=2, edges=HAND_CONNECTIONS
         )
         self._hand_vertex = sv.VertexAnnotator(
             color=sv.Color.from_hex("#4DA3FF"), radius=3
         )
-        self._box_annotator = sv.BoxCornerAnnotator(
+        self._box_annotator = sv.BoxAnnotator(
+            color=self._palette,
+            thickness=2,
+            color_lookup=sv.ColorLookup.CLASS,
+        )
+        self._box_corner_annotator = sv.BoxCornerAnnotator(
             color=self._palette,
             thickness=2,
             corner_length=14,
@@ -260,8 +327,15 @@ class VisionEngine:
                 show_pose=self._config.show_pose,
                 show_face=self._config.show_face,
                 show_hands=self._config.show_hands,
+                show_gemini=self._config.show_gemini,
                 confidence=self._config.confidence,
             )
+
+    def get_gemini_insight(self) -> GeminiInsight:
+        return self._gemini.get_insight()
+
+    def gemini_enabled(self) -> bool:
+        return self._gemini.enabled
 
     def update_config(self, **kwargs: object) -> VisionConfig:
         with self._lock:
@@ -273,6 +347,7 @@ class VisionEngine:
                 show_pose=self._config.show_pose,
                 show_face=self._config.show_face,
                 show_hands=self._config.show_hands,
+                show_gemini=self._config.show_gemini,
                 confidence=self._config.confidence,
             )
 
@@ -525,6 +600,7 @@ class VisionEngine:
 
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
+            self._gemini.start()
         except Exception as exc:
             self._release_models(cap, pose, face, hand)
             with self._lock:
@@ -547,6 +623,8 @@ class VisionEngine:
         with self._lock:
             self._running = False
             self._starting = False
+
+        self._gemini.stop()
 
         if self._bootstrap_thread and self._bootstrap_thread.is_alive():
             self._bootstrap_thread.join(timeout=3.0)
@@ -608,6 +686,7 @@ class VisionEngine:
                     show_pose=self._config.show_pose,
                     show_face=self._config.show_face,
                     show_hands=self._config.show_hands,
+                    show_gemini=self._config.show_gemini,
                     confidence=self._config.confidence,
                 )
 
@@ -679,6 +758,10 @@ class VisionEngine:
                     scene=annotated,
                     detections=detections,
                 )
+                annotated = self._box_corner_annotator.annotate(
+                    scene=annotated,
+                    detections=detections,
+                )
                 annotated = self._label_annotator.annotate(
                     scene=annotated,
                     detections=detections,
@@ -688,9 +771,19 @@ class VisionEngine:
                 annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
             if config.show_face:
                 annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
+                annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
+                annotated = draw_face_outlines(
+                    annotated, face_kp, color=(255, 107, 107)
+                )
             if config.show_hands:
                 annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
                 annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
+
+            gemini_insight = self._gemini.get_insight()
+            if config.show_gemini and self._gemini.enabled:
+                annotated = draw_gemini_boxes(
+                    annotated, gemini_insight, color=(167, 139, 250)
+                )
 
             with self._lock:
                 record_request = self._record_request
@@ -717,6 +810,9 @@ class VisionEngine:
             if not ok:
                 continue
 
+            jpeg_bytes = jpeg.tobytes()
+            self._gemini.push_frame(jpeg_bytes)
+
             now = time.perf_counter()
             elapsed = now - fps_clock
             fps_clock = now
@@ -728,7 +824,7 @@ class VisionEngine:
             track_items = list_tracked_objects(detections, class_names)
             alert_items = self._fire_alerts(object_summary)
             with self._lock:
-                self._latest_jpeg = jpeg.tobytes()
+                self._latest_jpeg = jpeg_bytes
                 self._stats = VisionStats(
                     state="live",
                     face_count=len(face_kp.xy) if config.show_face else 0,
