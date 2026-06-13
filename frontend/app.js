@@ -75,9 +75,6 @@ let lastObjectCount = null;
 const fpsHistory = [];
 const MAX_FPS_HISTORY = 48;
 
-const fpsHistory = [];
-const MAX_FPS_HISTORY = 48;
-
 const LOG_TAG_LABELS = {
   sys: "System",
   v3: "YUBI v3.0",
