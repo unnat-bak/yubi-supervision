@@ -42,6 +42,17 @@ class StartResponse(BaseModel):
     state: str
 
 
+class SessionReportRequest(BaseModel):
+    draft_markdown: str = Field(min_length=1)
+    session: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionReportResponse(BaseModel):
+    markdown: str
+    passes_completed: int = 0
+    enriched: bool = False
+
+
 class StatusResponse(BaseModel):
     state: str
     face_count: int = 0

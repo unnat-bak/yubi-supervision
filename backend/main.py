@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -12,9 +14,12 @@ from backend.schemas import (
     ConfigUpdate,
     GeminiStatusResponse,
     HealthResponse,
+    SessionReportRequest,
+    SessionReportResponse,
     StartResponse,
     StatusResponse,
 )
+from backend.session_report import enrich_session_report_events
 from backend.vision import VisionEngine
 
 settings = get_settings()
@@ -164,6 +169,87 @@ async def record_start() -> dict:
 async def record_stop() -> dict:
     engine.request_recording("stop")
     return {"recording": False}
+
+
+@app.post("/api/session-report", response_model=SessionReportResponse)
+async def session_report(payload: SessionReportRequest) -> SessionReportResponse:
+    if not settings.gemini_active:
+        return SessionReportResponse(
+            markdown=payload.draft_markdown,
+            passes_completed=0,
+            enriched=False,
+        )
+
+    def run() -> SessionReportResponse:
+        result_markdown = payload.draft_markdown
+        passes_completed = 0
+        enriched = False
+        for event in enrich_session_report_events(
+            payload.draft_markdown, payload.session, settings
+        ):
+            if event.get("phase") == "done":
+                result_markdown = str(event.get("markdown", result_markdown))
+                passes_completed = int(event.get("passes_completed", 0))
+                enriched = bool(event.get("enriched", False))
+        return SessionReportResponse(
+            markdown=result_markdown,
+            passes_completed=passes_completed,
+            enriched=enriched,
+        )
+
+    return await asyncio.to_thread(run)
+
+
+async def session_report_stream(payload: SessionReportRequest):
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    def worker() -> None:
+        try:
+            for event in enrich_session_report_events(
+                payload.draft_markdown, payload.session, settings
+            ):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "phase": "error",
+                    "message": "Session report failed — exporting raw log.",
+                    "detail": str(exc),
+                },
+            )
+            loop.call_soon_threadsafe(
+                queue.put_nowait,
+                {
+                    "phase": "done",
+                    "message": "Session report ready.",
+                    "markdown": payload.draft_markdown,
+                    "passes_completed": 0,
+                    "enriched": False,
+                },
+            )
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while True:
+        event = await queue.get()
+        if event is None:
+            break
+        line = json.dumps(event, ensure_ascii=False) + "\n"
+        yield line.encode("utf-8")
+
+
+@app.post("/api/session-report/stream")
+async def session_report_stream_endpoint(
+    payload: SessionReportRequest,
+) -> StreamingResponse:
+    return StreamingResponse(
+        session_report_stream(payload),
+        media_type="application/x-ndjson",
+    )
 
 
 async def mjpeg_stream():

@@ -1,7 +1,7 @@
 [project]
 name = "yubi-supervision"
 version = "0.1.0"
-description = "Live webcam vision with MediaPipe, YOLOv8, and supervision"
+description = "YUBI Supervision — live vision command center with YOLOv8, MediaPipe, micro-expressions, and YUBI v3.0 intelligence"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [

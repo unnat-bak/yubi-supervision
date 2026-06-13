@@ -15,11 +15,10 @@ from mediapipe.tasks.python.vision.face_landmarker import (
 from backend.config import Settings
 from backend.gemini_vision import normalize_box_2d
 
-# MediaPipe face mesh edge groups for expression mode (high-precision grid).
+# Expression mesh edges — structural groups only (no full tessellation; too heavy per frame).
 EXPR_MESH_CONNECTIONS: tuple[tuple[int, int], ...] = tuple(
     (conn.start, conn.end)
     for group in (
-        FLC.FACE_LANDMARKS_TESSELATION,
         FLC.FACE_LANDMARKS_FACE_OVAL,
         FLC.FACE_LANDMARKS_LEFT_EYEBROW,
         FLC.FACE_LANDMARKS_RIGHT_EYEBROW,
@@ -241,19 +240,56 @@ def _box_to_xyxy(box: list[int], width: int, height: int) -> tuple[int, int, int
     )
 
 
+def _connection_indices(group: Any) -> set[int]:
+    return {conn.start for conn in group} | {conn.end for conn in group}
+
+
+EXPR_BROW_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_LEFT_EYEBROW)
+    | _connection_indices(FLC.FACE_LANDMARKS_RIGHT_EYEBROW)
+)
+EXPR_EYE_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_LEFT_EYE)
+    | _connection_indices(FLC.FACE_LANDMARKS_RIGHT_EYE)
+)
+EXPR_IRIS_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_LEFT_IRIS)
+    | _connection_indices(FLC.FACE_LANDMARKS_RIGHT_IRIS)
+)
+
+# BGR — aligned with overlay pearl / signal palette in vision.py
+_TRACK_DOT_BASE = (210, 204, 197)
+_TRACK_DOT_ACTIVE = (235, 230, 224)
+_TRACK_MESH = (132, 144, 158)
+_TRACK_BOX = (118, 128, 142)
+
+
+def _draw_track_dots(
+    canvas: np.ndarray,
+    pts_i: np.ndarray,
+    indices: frozenset[int],
+    radius: int,
+    color: tuple[int, int, int],
+) -> None:
+    for idx in indices:
+        if idx >= len(pts_i):
+            continue
+        cv2.circle(canvas, tuple(pts_i[idx]), radius, color, -1, cv2.LINE_AA)
+
+
 def draw_expression_overlay(
     scene: np.ndarray,
     face_landmarks: list[list[Any]],
     guidance: ExpressionGuidance,
     micro_events: list[MicroEvent],
-    mesh_alpha: float = 0.38,
 ) -> np.ndarray:
     if not face_landmarks:
         return scene
 
     height, width = scene.shape[:2]
-    overlay = scene.copy()
     highlight_regions: set[str] = {e.region for e in micro_events}
+    brow_active = "eyebrow" in highlight_regions
+    eye_active = "under-eye" in highlight_regions
 
     for landmarks in face_landmarks:
         points = landmarks_to_points(landmarks, width, height)
@@ -264,10 +300,10 @@ def draw_expression_overlay(
             if start >= len(pts_i) or end >= len(pts_i):
                 continue
             cv2.line(
-                overlay,
+                scene,
                 tuple(pts_i[start]),
                 tuple(pts_i[end]),
-                (168, 176, 184),
+                _TRACK_MESH,
                 1,
                 cv2.LINE_AA,
             )
@@ -281,39 +317,31 @@ def draw_expression_overlay(
             if not box:
                 continue
             x1, y1, x2, y2 = _box_to_xyxy(box, width, height)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), (150, 158, 168), 1, cv2.LINE_AA)
+            cv2.rectangle(scene, (x1, y1), (x2, y2), _TRACK_BOX, 1, cv2.LINE_AA)
 
-        if "eyebrow" in highlight_regions:
-            brow_pts = []
-            for idx in {c.start for c in FLC.FACE_LANDMARKS_LEFT_EYEBROW} | {
-                c.end for c in FLC.FACE_LANDMARKS_LEFT_EYEBROW
-            }:
-                if idx < len(pts_i):
-                    brow_pts.append(pts_i[idx])
-            for idx in {c.start for c in FLC.FACE_LANDMARKS_RIGHT_EYEBROW} | {
-                c.end for c in FLC.FACE_LANDMARKS_RIGHT_EYEBROW
-            }:
-                if idx < len(pts_i):
-                    brow_pts.append(pts_i[idx])
-            for pt in brow_pts:
-                cv2.circle(overlay, tuple(pt), 2, (195, 200, 208), -1, cv2.LINE_AA)
+        _draw_track_dots(
+            scene,
+            pts_i,
+            EXPR_BROW_INDICES,
+            2 if brow_active else 1,
+            _TRACK_DOT_ACTIVE if brow_active else _TRACK_DOT_BASE,
+        )
+        _draw_track_dots(
+            scene,
+            pts_i,
+            EXPR_EYE_INDICES,
+            2 if eye_active else 1,
+            _TRACK_DOT_ACTIVE if eye_active else _TRACK_DOT_BASE,
+        )
+        _draw_track_dots(
+            scene,
+            pts_i,
+            EXPR_IRIS_INDICES,
+            1,
+            _TRACK_DOT_ACTIVE if eye_active else _TRACK_DOT_BASE,
+        )
 
-        if "under-eye" in highlight_regions:
-            eye_pts = []
-            for idx in {c.start for c in FLC.FACE_LANDMARKS_LEFT_EYE} | {
-                c.end for c in FLC.FACE_LANDMARKS_LEFT_EYE
-            }:
-                if idx < len(pts_i):
-                    eye_pts.append(pts_i[idx])
-            for idx in {c.start for c in FLC.FACE_LANDMARKS_RIGHT_EYE} | {
-                c.end for c in FLC.FACE_LANDMARKS_RIGHT_EYE
-            }:
-                if idx < len(pts_i):
-                    eye_pts.append(pts_i[idx])
-            for pt in eye_pts:
-                cv2.circle(overlay, tuple(pt), 1, (195, 200, 208), -1, cv2.LINE_AA)
-
-    return cv2.addWeighted(overlay, mesh_alpha, scene, 1.0 - mesh_alpha, 0)
+    return scene
 
 
 class ExpressionEnricher:
@@ -356,6 +384,22 @@ class ExpressionEnricher:
         )
         if is_first or interval_ok:
             self._schedule_analysis()
+
+    def wants_face_analysis(self) -> bool:
+        """True when a new v3.0 face pass should run (skip per-frame face crop otherwise)."""
+        with self._lock:
+            if not self._active:
+                return False
+            if self._analysis_in_flight:
+                return False
+            guidance = self._guidance
+        now = time.time()
+        is_first = guidance.updated_at is None
+        interval_ok = (
+            guidance.updated_at is not None
+            and now - guidance.updated_at >= self._settings.gemini_interval_sec
+        )
+        return is_first or interval_ok
 
     def get_guidance(self) -> ExpressionGuidance:
         with self._lock:

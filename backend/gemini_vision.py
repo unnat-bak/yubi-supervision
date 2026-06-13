@@ -107,6 +107,8 @@ def labels_match(gemini_label: str, local_label: str) -> bool:
         "laptop": ("computer", "notebook"),
         "tv": ("monitor", "screen", "television"),
         "chair": ("seat", "stool"),
+        "dining table": ("table", "desk", "shelf", "cabinet", "furniture", "stand"),
+        "table": ("desk", "shelf", "cabinet", "furniture", "stand"),
     }
     for canonical, words in aliases.items():
         if canonical in g or canonical in y:
@@ -183,6 +185,274 @@ def analysis_width_for_frame(frame_width: int, settings: Settings) -> int:
     return width
 
 
+def best_insight_match_for_box(
+    xyxy: tuple[int, int, int, int],
+    insight: GeminiInsight,
+    width: int,
+    height: int,
+    min_iou: float = 0.22,
+) -> tuple[GeminiObject | None, float]:
+    if not insight.objects:
+        return None, 0.0
+    best_obj: GeminiObject | None = None
+    best_iou = 0.0
+    for obj in insight.objects:
+        gbox = box_2d_to_xyxy(obj.box_2d, width, height)
+        iou = box_iou(xyxy, gbox)
+        if iou > best_iou:
+            best_iou = iou
+            best_obj = obj
+    if best_iou < min_iou:
+        return None, best_iou
+    return best_obj, best_iou
+
+
+class TrackLabelCache:
+    """Sticky v3.0-confirmed labels per ByteTrack id."""
+
+    def __init__(self, max_age_sec: float) -> None:
+        self._max_age_sec = max_age_sec
+        self._entries: dict[int, dict[str, Any]] = {}
+
+    def reset(self) -> None:
+        self._entries.clear()
+
+    def get(self, tracker_id: int) -> dict[str, Any] | None:
+        entry = self._entries.get(tracker_id)
+        if entry is None:
+            return None
+        if time.time() - float(entry["updated_at"]) > self._max_age_sec:
+            del self._entries[tracker_id]
+            return None
+        return entry
+
+    def set(self, tracker_id: int, label: str, confidence: float, source: str = "v3") -> None:
+        self._entries[tracker_id] = {
+            "label": label,
+            "confidence": round(confidence, 2),
+            "source": source,
+            "updated_at": time.time(),
+        }
+
+    def prune(self, active_ids: set[int]) -> None:
+        for tracker_id in list(self._entries.keys()):
+            if tracker_id not in active_ids:
+                del self._entries[tracker_id]
+
+
+def _iter_tracked_detection_indices(detections: Any) -> list[tuple[int, int]]:
+    """(detection_index, tracker_id) — safe when tracker_id is a numpy ndarray."""
+    if detections.is_empty() or detections.tracker_id is None:
+        return []
+    pairs: list[tuple[int, int]] = []
+    tracker_ids = detections.tracker_id
+    for index in range(len(detections)):
+        raw = tracker_ids[index]
+        if raw is None:
+            continue
+        pairs.append((index, int(raw)))
+    return pairs
+
+
+def collect_uncertain_hints(
+    tracks: list[dict[str, Any]],
+    detections: Any,
+    verify_below: float,
+    width: int,
+    height: int,
+) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    if detections.is_empty() or detections.xyxy is None:
+        return hints
+    track_ids = {int(t["tracker_id"]) for t in tracks if t.get("tracker_id") is not None}
+    for index, tid in _iter_tracked_detection_indices(detections):
+        if tid not in track_ids:
+            continue
+        conf = detections.confidence[index]
+        if conf is None or float(conf) >= verify_below:
+            continue
+        track = next((t for t in tracks if t.get("tracker_id") == tid), None)
+        if not track:
+            continue
+        x1, y1, x2, y2 = [int(v) for v in detections.xyxy[index]]
+        hints.append(
+            {
+                "local_label": str(track["label"]),
+                "confidence": round(float(conf), 2),
+                "tracker_id": tid,
+                "box_2d": [
+                    int(y1 * 1000 / height),
+                    int(x1 * 1000 / width),
+                    int(y2 * 1000 / height),
+                    int(x2 * 1000 / width),
+                ],
+            }
+        )
+    return hints
+
+
+def reconcile_tracked_objects(
+    tracks: list[dict[str, Any]],
+    detections: Any,
+    insight: GeminiInsight,
+    width: int,
+    height: int,
+    cache: TrackLabelCache,
+    verify_below: float,
+    insight_max_age_sec: float,
+    min_display_conf: float,
+) -> list[dict[str, Any]]:
+    """
+    Apply sticky v3.0 labels, verify low-confidence local detections, and
+    suppress unconfirmed noise (e.g. spurious toothbrush at 18%).
+    """
+    fresh_insight = insight_is_fresh(insight, insight_max_age_sec)
+    xyxy_by_tracker: dict[int, tuple[int, int, int, int]] = {}
+    if not detections.is_empty() and detections.xyxy is not None:
+        for index, tracker_id in _iter_tracked_detection_indices(detections):
+            xyxy = tuple(int(v) for v in detections.xyxy[index])
+            xyxy_by_tracker[tracker_id] = xyxy
+
+    active_ids = {
+        int(t["tracker_id"]) for t in tracks if t.get("tracker_id") is not None
+    }
+    cache.prune(active_ids)
+
+    reconciled: list[dict[str, Any]] = []
+    for track in tracks:
+        tid = track.get("tracker_id")
+        if tid is None:
+            if float(track["confidence"]) >= min_display_conf:
+                reconciled.append(dict(track))
+            continue
+
+        tracker_id = int(tid)
+        yolo_label = str(track["label"])
+        yolo_conf = float(track["confidence"])
+
+        cached = cache.get(tracker_id)
+        if cached is not None:
+            reconciled.append(
+                {
+                    "label": cached["label"],
+                    "confidence": float(cached["confidence"]),
+                    "tracker_id": tracker_id,
+                    "source": cached["source"],
+                    "verified": cached["source"] == "v3",
+                }
+            )
+            continue
+
+        gemini_obj: GeminiObject | None = None
+        if fresh_insight and tracker_id in xyxy_by_tracker:
+            gemini_obj, _ = best_insight_match_for_box(
+                xyxy_by_tracker[tracker_id], insight, width, height
+            )
+
+        if gemini_obj is not None:
+            g_label = gemini_obj.label
+            g_conf = float(gemini_obj.confidence)
+            if g_conf >= 0.42:
+                if yolo_conf < verify_below or not labels_match(g_label, yolo_label):
+                    merged_conf = max(yolo_conf, g_conf)
+                    cache.set(tracker_id, g_label, merged_conf)
+                    reconciled.append(
+                        {
+                            "label": g_label,
+                            "confidence": round(merged_conf, 2),
+                            "tracker_id": tracker_id,
+                            "source": "v3",
+                            "verified": True,
+                        }
+                    )
+                    continue
+                if labels_match(g_label, yolo_label):
+                    merged_conf = max(yolo_conf, g_conf)
+                    cache.set(tracker_id, yolo_label, merged_conf)
+                    reconciled.append(
+                        {
+                            "label": yolo_label,
+                            "confidence": round(merged_conf, 2),
+                            "tracker_id": tracker_id,
+                            "source": "v3",
+                            "verified": True,
+                        }
+                    )
+                    continue
+
+        if yolo_conf < verify_below:
+            continue
+
+        if yolo_conf >= min_display_conf:
+            reconciled.append(
+                {
+                    "label": yolo_label,
+                    "confidence": round(yolo_conf, 2),
+                    "tracker_id": tracker_id,
+                    "source": "yolo",
+                    "verified": False,
+                }
+            )
+
+    reconciled.sort(key=lambda item: float(item["confidence"]), reverse=True)
+    return reconciled
+
+
+def build_reconciled_detection_labels(
+    reconciled: list[dict[str, Any]],
+    detections: Any,
+    class_names: dict[int, str],
+    min_display_conf: float,
+) -> tuple[list[int], list[str]]:
+    """Return detection indices + overlay labels for reconciled tracks."""
+    if detections.is_empty():
+        return [], []
+
+    by_id = {
+        int(t["tracker_id"]): t
+        for t in reconciled
+        if t.get("tracker_id") is not None
+    }
+    indices: list[int] = []
+    labels: list[str] = []
+
+    for index in range(len(detections)):
+        conf = detections.confidence[index]
+        if conf is None:
+            continue
+        tracker_id = None
+        if detections.tracker_id is not None and index < len(detections.tracker_id):
+            raw_tid = detections.tracker_id[index]
+            tracker_id = int(raw_tid) if raw_tid is not None else None
+
+        if tracker_id is not None and tracker_id in by_id:
+            item = by_id[tracker_id]
+            display_conf = float(item["confidence"])
+            if display_conf < min_display_conf:
+                continue
+            label = str(item["label"])
+            suffix = f" #{tracker_id}"
+            if item.get("verified"):
+                labels.append(f"{label}{suffix} {display_conf:.0%} ✓")
+            else:
+                labels.append(f"{label}{suffix} {display_conf:.0%}")
+            indices.append(index)
+            continue
+
+        class_id = detections.class_id[index]
+        if class_id is None:
+            continue
+        yolo_conf = float(conf)
+        if yolo_conf < min_display_conf:
+            continue
+        label = class_names.get(int(class_id), str(class_id))
+        suffix = f" #{tracker_id}" if tracker_id is not None else ""
+        labels.append(f"{label}{suffix} {yolo_conf:.0%}")
+        indices.append(index)
+
+    return indices, labels
+
+
 class GeminiEnricher:
     """Periodic v3.0 scene analysis — first frame ASAP, then on an interval."""
 
@@ -192,6 +462,7 @@ class GeminiEnricher:
         self._running = False
         self._analysis_in_flight = False
         self._latest_jpeg: bytes | None = None
+        self._uncertain_hints: list[dict[str, Any]] = []
         self._insight = GeminiInsight(
             state="disabled" if not self.enabled else "idle"
         )
@@ -200,7 +471,9 @@ class GeminiEnricher:
     def enabled(self) -> bool:
         return bool(self._settings.gemini_api_key) and self._settings.gemini_enabled
 
-    def push_frame(self, jpeg_bytes: bytes) -> None:
+    def push_frame(
+        self, jpeg_bytes: bytes, uncertain: list[dict[str, Any]] | None = None
+    ) -> None:
         """Store latest clean frame; trigger analysis on first frame or interval."""
         if not self.enabled:
             return
@@ -208,6 +481,8 @@ class GeminiEnricher:
             if not self._running:
                 return
             self._latest_jpeg = jpeg_bytes
+            if uncertain:
+                self._uncertain_hints = uncertain
             insight = self._insight
             in_flight = self._analysis_in_flight
         if in_flight:
@@ -221,6 +496,24 @@ class GeminiEnricher:
         )
         if is_first or interval_ok:
             self._schedule_analysis()
+
+    def wants_new_analysis(self) -> bool:
+        """True when a new v3.0 scene pass should run (skip per-frame JPEG encode otherwise)."""
+        if not self.enabled:
+            return False
+        with self._lock:
+            if not self._running:
+                return False
+            if self._analysis_in_flight:
+                return False
+            insight = self._insight
+        now = time.time()
+        is_first = insight.updated_at is None
+        interval_ok = (
+            insight.updated_at is not None
+            and now - insight.updated_at >= self._settings.gemini_interval_sec
+        )
+        return is_first or interval_ok
 
     def start(self) -> None:
         if not self.enabled:
@@ -282,8 +575,12 @@ class GeminiEnricher:
         ).start()
 
     def _run_analysis(self, jpeg_bytes: bytes) -> None:
+        hints: list[dict[str, Any]] = []
         try:
-            insight = self._analyze(jpeg_bytes)
+            with self._lock:
+                hints = list(self._uncertain_hints)
+                self._uncertain_hints = []
+            insight = self._analyze(jpeg_bytes, hints)
             self._set_insight(
                 state="ready",
                 scene_summary=insight.scene_summary,
@@ -296,7 +593,9 @@ class GeminiEnricher:
         finally:
             self._analysis_in_flight = False
 
-    def _analyze(self, jpeg_bytes: bytes) -> GeminiInsight:
+    def _analyze(
+        self, jpeg_bytes: bytes, uncertain_hints: list[dict[str, Any]] | None = None
+    ) -> GeminiInsight:
         from google import genai
         from google.genai import types
 
@@ -306,12 +605,19 @@ class GeminiEnricher:
             '- "scene_summary": one sentence about the scene and activity\n'
             '- "objects": array of visible items. Each item:\n'
             '  - "label": short name matching common detection classes when possible '
-            '(person, chair, laptop, cell phone, cup, book, etc.)\n'
+            '(person, chair, laptop, cell phone, cup, book, shelf, cabinet, etc.)\n'
             '  - "confidence": 0.0-1.0\n'
             '  - "box_2d": [ymin, xmin, ymax, xmax] normalized 0-1000\n'
             "Tight boxes on visible object edges. ymin/xmin = top-left, ymax/xmax = bottom-right. "
+            "Only include objects you can clearly see — omit guesses and tiny clutter. "
             f"Limit to {self._settings.gemini_max_objects} objects."
         )
+        if uncertain_hints:
+            prompt += (
+                "\n\nThe local detector flagged these LOW-CONFIDENCE regions for verification. "
+                "For each, confirm the label, correct it, or omit if not a real object:\n"
+                + json.dumps(uncertain_hints, indent=2)
+            )
 
         response = client.models.generate_content(
             model=self._settings.gemini_model,
