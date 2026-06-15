@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     source_loop: bool = True
     # Preferred yt-dlp format selector when resolving a YouTube/stream URL.
     youtube_format: str = "best[ext=mp4][height<=1080]/best[height<=1080]/best"
+    # Local folder for YouTube clips (default: system temp / yubi-supervision / youtube).
+    youtube_cache_dir: Optional[str] = None  # noqa: UP045
+    # Delete cached YouTube clips older than this many hours (0 = never auto-prune).
+    youtube_cache_max_age_hours: int = Field(default=168, ge=0, le=8760)
 
     yolo_model: str = "yolov8s.pt"
     yolo_imgsz: int = 640

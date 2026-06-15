@@ -50,6 +50,7 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     app: str
     vision_state: str
+    youtube_cache_dir: str = ""
 
 
 class StartResponse(BaseModel):

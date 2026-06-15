@@ -21,6 +21,7 @@ from backend.schemas import (
     StatusResponse,
 )
 from backend.session_report import enrich_session_report_events
+from backend.sources import get_youtube_cache_dir, prune_youtube_cache
 from backend.vision import VisionEngine
 
 settings = get_settings()
@@ -29,6 +30,8 @@ engine = VisionEngine(settings=settings)
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    cache_dir = get_youtube_cache_dir(settings.youtube_cache_dir)
+    prune_youtube_cache(cache_dir, float(settings.youtube_cache_max_age_hours))
     yield
     await asyncio.to_thread(engine.stop)
 
@@ -44,9 +47,11 @@ async def index() -> FileResponse:
 @app.get("/api/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
     stats = engine.get_stats()
+    cache_dir = get_youtube_cache_dir(settings.youtube_cache_dir)
     return HealthResponse(
         app=settings.app_name,
         vision_state=stats.state,
+        youtube_cache_dir=str(cache_dir),
     )
 
 

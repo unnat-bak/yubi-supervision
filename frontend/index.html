@@ -41,6 +41,7 @@
               placeholder="Webcam — or paste a video file, YouTube, or RTSP URL"
             />
             <p class="source-hint">Leave blank for the server webcam</p>
+            <p id="source-cache-hint" class="source-hint source-cache-hint" hidden></p>
           </div>
           <p class="idle-hint">Initialize feed · <kbd>Space</kbd></p>
         </div>
@@ -101,13 +102,14 @@
             <span id="telemetry-uptime" class="telemetry-v">00:00</span>
           </span>
         </div>
-        <div id="pipeline-rail" class="pipeline-rail" hidden>
+        <div id="pipeline-rail" class="pipeline-rail" hidden title="Click a layer to toggle overlays">
           <span class="pipe-item" data-pipe="objects"><span class="pipe-dot"></span>OBS</span>
           <span class="pipe-item" data-pipe="pose"><span class="pipe-dot"></span>SKEL</span>
           <span class="pipe-item" data-pipe="face"><span class="pipe-dot"></span>FACE</span>
           <span class="pipe-item" data-pipe="hands"><span class="pipe-dot"></span>HAND</span>
           <span class="pipe-item" data-pipe="expressions"><span class="pipe-dot"></span>EXPR</span>
           <span class="pipe-item" data-pipe="masks"><span class="pipe-dot"></span>MASK</span>
+          <span class="pipe-item" data-pipe="jtags" title="Toggle joint tags"><span class="pipe-dot"></span>JTAG</span>
           <span class="pipe-item" data-pipe="identity"><span class="pipe-dot"></span>ID</span>
           <span class="pipe-item" data-pipe="v3"><span class="pipe-dot"></span>V3.0</span>
         </div>
@@ -173,6 +175,24 @@
               </div>
               <div class="expr-region-bar">
                 <div id="expr-bar-eye" class="expr-region-fill"></div>
+              </div>
+            </div>
+            <div class="expr-region">
+              <div class="expr-region-head">
+                <span class="expr-region-label">Nose</span>
+                <span id="expr-region-nose-val" class="expr-region-val">—</span>
+              </div>
+              <div class="expr-region-bar">
+                <div id="expr-bar-nose" class="expr-region-fill"></div>
+              </div>
+            </div>
+            <div class="expr-region">
+              <div class="expr-region-head">
+                <span class="expr-region-label">Mouth</span>
+                <span id="expr-region-mouth-val" class="expr-region-val">—</span>
+              </div>
+              <div class="expr-region-bar">
+                <div id="expr-bar-mouth" class="expr-region-fill"></div>
               </div>
             </div>
           </div>
@@ -243,13 +263,15 @@
         <div class="controls">
           <button id="btn-start" class="btn btn-primary">Initialize</button>
           <button id="btn-stop" class="btn btn-secondary" disabled>Terminate</button>
+          <button id="btn-focus" class="btn btn-secondary btn-chrome" type="button" disabled title="Hide side panels for a full-screen feed">Focus</button>
+          <button id="btn-clean" class="btn btn-secondary btn-chrome" type="button" disabled title="Toggle all vision overlays off/on">Clean feed</button>
           <button id="btn-snapshot" class="btn btn-secondary" disabled>Capture</button>
           <button id="btn-record" class="btn btn-secondary" disabled>
             <span class="rec-dot"></span>Record
           </button>
         </div>
         <p class="shortcut-hint">
-          <kbd>Space</kbd> init · <kbd>S</kbd> capture · <kbd>Q</kbd> / <kbd>Esc</kbd> terminate
+          <kbd>Space</kbd> init · <kbd>S</kbd> capture · <kbd>F</kbd> focus · <kbd>C</kbd> clean · <kbd>Q</kbd> / <kbd>Esc</kbd> terminate
         </p>
       </footer>
 

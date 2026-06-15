@@ -19,6 +19,8 @@ def test_health() -> None:
     assert payload["status"] == "ok"
     assert payload["app"] == "YUBI Supervision"
     assert payload["vision_state"] == "idle"
+    assert "youtube_cache_dir" in payload
+    assert payload["youtube_cache_dir"]
 
 
 def test_config_round_trip() -> None:
