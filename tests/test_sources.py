@@ -75,11 +75,31 @@ def test_resolve_youtube_downloads_local_clip() -> None:
     download.assert_called_once()
     assert download.call_args.args[0] == "https://youtu.be/abc123XYZ01"
     assert download.call_args.args[1] == "best[ext=mp4]/best"
+    assert download.call_args.kwargs["prefetched_info"] == vod_info
     assert resolved.kind == "youtube"
     assert resolved.target == "/tmp/yubi-test.mp4"
     assert resolved.cleanup_path == "/tmp/yubi-test.mp4"
     assert resolved.is_live is False
     assert resolved.label == "CCTV clip"
+
+
+def test_resolve_youtube_was_live_treated_as_vod() -> None:
+    vod_info = {
+        "title": "Past broadcast",
+        "is_live": False,
+        "live_status": "was_live",
+    }
+    with patch("backend.sources.probe_youtube", return_value=vod_info), patch(
+        "backend.sources.download_youtube_clip",
+        return_value=("/tmp/past.mp4", "Past broadcast"),
+    ) as download:
+        resolved = resolve_source(
+            "https://youtu.be/pastlive01",
+            camera_index=0,
+            youtube_format="best",
+        )
+    download.assert_called_once()
+    assert resolved.is_live is False
 
 
 def test_resolve_youtube_live_stream() -> None:
@@ -89,17 +109,45 @@ def test_resolve_youtube_live_stream() -> None:
         "live_status": "is_live",
         "url": "https://cdn.example/live.m3u8",
     }
-    with patch("backend.sources.probe_youtube", return_value=live_info):
+    with patch("backend.sources.probe_youtube", return_value=live_info) as probe:
         resolved = resolve_source(
             "https://www.youtube.com/live/EO_1LWqsCNE",
             camera_index=0,
             youtube_format="best[ext=mp4]/best",
         )
+    probe.assert_called_once_with("https://www.youtube.com/live/EO_1LWqsCNE")
     assert resolved.kind == "youtube"
     assert resolved.target == "https://cdn.example/live.m3u8"
     assert resolved.is_live is True
     assert resolved.cleanup_path is None
     assert "LIVE" in resolved.label
+
+
+def test_resolve_youtube_live_falls_back_to_format_probe() -> None:
+    live_meta = {
+        "title": "City cam",
+        "is_live": True,
+        "live_status": "is_live",
+        "formats": [],
+    }
+    live_with_url = {
+        **live_meta,
+        "url": "https://cdn.example/live.m3u8",
+    }
+
+    def probe_side_effect(url: str, fmt: str | None = None, **_kwargs):
+        assert url == "https://www.youtube.com/live/EO_1LWqsCNE"
+        if fmt:
+            return live_with_url
+        return live_meta
+
+    with patch("backend.sources.probe_youtube", side_effect=probe_side_effect):
+        resolved = resolve_source(
+            "https://www.youtube.com/live/EO_1LWqsCNE",
+            camera_index=0,
+            youtube_format="best",
+        )
+    assert resolved.target == "https://cdn.example/live.m3u8"
 
 
 def test_refresh_youtube_live_stream() -> None:

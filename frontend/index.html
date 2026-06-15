@@ -154,7 +154,67 @@
         <canvas id="fps-sparkline" class="fps-sparkline" width="96" height="32" aria-hidden="true"></canvas>
       </div>
 
-      <div id="right-rail" class="right-rail">
+      <div id="left-rail" class="side-rail side-rail--left" hidden>
+        <aside id="detections-panel" class="intel-panel detections-panel" hidden>
+          <div class="panel-header">
+            <span class="panel-title">Object registry</span>
+            <span id="object-total" class="panel-badge">0</span>
+          </div>
+          <section class="layers-section" aria-label="Pipeline layers">
+            <div class="panel-header panel-header--compact">
+              <span class="panel-title">Pipeline layers</span>
+            </div>
+            <div id="layer-toggles" class="layer-toggles layer-grid">
+              <button class="layer-chip active" data-layer="show_objects" type="button">Objects</button>
+              <button class="layer-chip active" data-layer="show_pose" type="button">Pose</button>
+              <button class="layer-chip active" data-layer="show_face" type="button">Face</button>
+              <button class="layer-chip active" data-layer="show_hands" type="button">Hands</button>
+              <button class="layer-chip" data-layer="show_expressions" type="button">Expressions</button>
+              <button class="layer-chip" data-layer="show_masks" type="button">Masks</button>
+              <button class="layer-chip" data-layer="show_pose_labels" type="button">Joint tags</button>
+              <button class="layer-chip" data-layer="show_identity" type="button">Identity</button>
+              <button class="layer-chip active" data-layer="show_gemini" type="button">YUBI v3.0</button>
+            </div>
+          </section>
+          <label class="confidence-control">
+            <span>Confidence gate</span>
+            <span id="confidence-value">35%</span>
+            <input id="confidence-slider" type="range" min="10" max="90" value="35" />
+          </label>
+          <ul id="detections-list" class="detections-list"></ul>
+          <p id="detections-empty" class="detections-empty">No objects in frame</p>
+          <div id="intel-feed" class="intel-feed">
+            <div class="feed-header">
+              <span class="panel-title">Intel feed</span>
+              <span id="feed-count" class="panel-badge">0</span>
+            </div>
+            <ul id="feed-list" class="feed-list"></ul>
+          </div>
+        </aside>
+        <button
+          type="button"
+          id="toggle-left-panel"
+          class="panel-edge-toggle panel-edge-toggle--left"
+          aria-controls="detections-panel"
+          aria-expanded="true"
+          title="Collapse object registry"
+        >
+          <span class="panel-edge-icon" aria-hidden="true">‹</span>
+        </button>
+      </div>
+
+      <div id="right-rail" class="side-rail side-rail--right" hidden>
+        <button
+          type="button"
+          id="toggle-right-panel"
+          class="panel-edge-toggle panel-edge-toggle--right"
+          aria-controls="analysis-panel"
+          aria-expanded="true"
+          title="Collapse intelligence panel"
+        >
+          <span class="panel-edge-icon" aria-hidden="true">›</span>
+        </button>
+        <div class="side-rail-stack">
         <aside id="expression-panel" class="intel-panel expression-panel" hidden>
           <div class="panel-header">
             <span class="panel-title">Micro-expression tracking</span>
@@ -226,44 +286,8 @@
           <p id="analysis-empty" class="detections-empty" hidden>Awaiting inference…</p>
           <p id="analysis-error" class="analysis-error" hidden></p>
         </aside>
+        </div>
       </div>
-
-      <aside id="detections-panel" class="intel-panel detections-panel" hidden>
-        <div class="panel-header">
-          <span class="panel-title">Object registry</span>
-          <span id="object-total" class="panel-badge">0</span>
-        </div>
-        <section class="layers-section" aria-label="Pipeline layers">
-          <div class="panel-header panel-header--compact">
-            <span class="panel-title">Pipeline layers</span>
-          </div>
-          <div id="layer-toggles" class="layer-toggles layer-grid">
-            <button class="layer-chip active" data-layer="show_objects" type="button">Objects</button>
-            <button class="layer-chip active" data-layer="show_pose" type="button">Pose</button>
-            <button class="layer-chip active" data-layer="show_face" type="button">Face</button>
-            <button class="layer-chip active" data-layer="show_hands" type="button">Hands</button>
-            <button class="layer-chip" data-layer="show_expressions" type="button">Expressions</button>
-            <button class="layer-chip" data-layer="show_masks" type="button">Masks</button>
-            <button class="layer-chip" data-layer="show_pose_labels" type="button">Joint tags</button>
-            <button class="layer-chip" data-layer="show_identity" type="button">Identity</button>
-            <button class="layer-chip active" data-layer="show_gemini" type="button">YUBI v3.0</button>
-          </div>
-        </section>
-        <label class="confidence-control">
-          <span>Confidence gate</span>
-          <span id="confidence-value">35%</span>
-          <input id="confidence-slider" type="range" min="10" max="90" value="35" />
-        </label>
-        <ul id="detections-list" class="detections-list"></ul>
-        <p id="detections-empty" class="detections-empty">No objects in frame</p>
-        <div id="intel-feed" class="intel-feed">
-          <div class="feed-header">
-            <span class="panel-title">Intel feed</span>
-            <span id="feed-count" class="panel-badge">0</span>
-          </div>
-          <ul id="feed-list" class="feed-list"></ul>
-        </div>
-      </aside>
 
       <footer class="intel-panel command-footer">
         <div class="controls">

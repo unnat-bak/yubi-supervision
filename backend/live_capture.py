@@ -8,6 +8,7 @@ import threading
 import time
 from typing import Any, Protocol
 
+import cv2
 import numpy as np
 
 
@@ -219,6 +220,17 @@ class OpenCvReader:
     def interrupt(self) -> None:
         """Mark ended; ``VideoCapture.release`` must run on the capture thread."""
         self._ended = True
+
+    def seek_to_start(self) -> bool:
+        """Rewind a seekable capture (file / downloaded clip) for looping."""
+        if self._released or self._cap is None:
+            return False
+        try:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        except Exception:
+            return False
+        self._ended = False
+        return True
 
     def read(self) -> tuple[bool, np.ndarray | None]:
         if self._released or self._cap is None:

@@ -27,7 +27,7 @@ YUBI v3.0 (gemini_vision.py)    ExpressionEnricher (expression_vision.py)
 
 ### Remote live (YouTube / RTSP)
 
-For `source_kind` of `youtube` or `stream`, MJPEG is **decoupled from inference**:
+For `source_kind` of `youtube` or `stream` **when `source_is_live` is true**, MJPEG is **decoupled from inference**:
 
 - **Capture thread** publishes frames into a `LatestFrameSlot` (sequence id + BGR buffer).
 - **Stream publisher thread** encodes fresh JPEGs at `LIVE_STREAM_FPS` into `_stream_jpeg`; `/api/stream` always serves this buffer.

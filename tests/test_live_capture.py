@@ -57,3 +57,15 @@ def test_opencv_reader_release_is_idempotent() -> None:
     cap.release.assert_called_once()
     ok, frame = reader.read()
     assert ok is False and frame is None
+
+
+def test_opencv_reader_seek_to_start_rewinds_capture() -> None:
+    from unittest.mock import MagicMock
+
+    cap = MagicMock()
+    reader = OpenCvReader(cap)
+    reader._ended = True
+
+    assert reader.seek_to_start() is True
+    cap.set.assert_called_once()
+    assert reader.ended is False
