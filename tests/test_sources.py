@@ -16,6 +16,14 @@ def test_classify_webcam() -> None:
 def test_classify_youtube() -> None:
     assert classify_source("https://www.youtube.com/watch?v=abc123") == "youtube"
     assert classify_source("https://youtu.be/abc123") == "youtube"
+    assert classify_source("https://www.youtube.com/live/EO_1LWqsCNE") == "youtube"
+
+
+def test_classify_youtube_live_url_not_stream() -> None:
+    """https:// live page URLs must route to YouTube, not generic HTTP stream."""
+    url = "https://www.youtube.com/live/EO_1LWqsCNE"
+    assert classify_source(url) == "youtube"
+    assert classify_source(url) != "stream"
 
 
 def test_classify_stream_and_file() -> None:
@@ -54,7 +62,8 @@ def test_resolve_stream_is_live() -> None:
 
 
 def test_resolve_youtube_downloads_local_clip() -> None:
-    with patch(
+    vod_info = {"title": "CCTV clip", "is_live": False, "live_status": "not_live"}
+    with patch("backend.sources.probe_youtube", return_value=vod_info), patch(
         "backend.sources.download_youtube_clip",
         return_value=("/tmp/yubi-test.mp4", "CCTV clip"),
     ) as download:
@@ -71,6 +80,57 @@ def test_resolve_youtube_downloads_local_clip() -> None:
     assert resolved.cleanup_path == "/tmp/yubi-test.mp4"
     assert resolved.is_live is False
     assert resolved.label == "CCTV clip"
+
+
+def test_resolve_youtube_live_stream() -> None:
+    live_info = {
+        "title": "City cam",
+        "is_live": True,
+        "live_status": "is_live",
+        "url": "https://cdn.example/live.m3u8",
+    }
+    with patch("backend.sources.probe_youtube", return_value=live_info):
+        resolved = resolve_source(
+            "https://www.youtube.com/live/EO_1LWqsCNE",
+            camera_index=0,
+            youtube_format="best[ext=mp4]/best",
+        )
+    assert resolved.kind == "youtube"
+    assert resolved.target == "https://cdn.example/live.m3u8"
+    assert resolved.is_live is True
+    assert resolved.cleanup_path is None
+    assert "LIVE" in resolved.label
+
+
+def test_refresh_youtube_live_stream() -> None:
+    live_info = {
+        "is_live": True,
+        "live_status": "is_live",
+        "url": "https://cdn.example/refreshed.m3u8",
+    }
+    with patch("backend.sources.probe_youtube", return_value=live_info):
+        from backend.sources import refresh_youtube_live_stream
+
+        url = refresh_youtube_live_stream("https://www.youtube.com/live/EO_1LWqsCNE")
+    assert url == "https://cdn.example/refreshed.m3u8"
+
+
+def test_resolve_youtube_upcoming_raises() -> None:
+    with patch(
+        "backend.sources.probe_youtube",
+        return_value={"live_status": "is_upcoming", "title": "Soon"},
+    ):
+        try:
+            resolve_source(
+                "https://youtu.be/upcoming",
+                camera_index=0,
+                youtube_format="best",
+            )
+            raised = False
+        except RuntimeError as exc:
+            raised = True
+            assert "not started" in str(exc).lower()
+    assert raised
 
 
 def test_prune_youtube_cache_removes_old_files(tmp_path) -> None:

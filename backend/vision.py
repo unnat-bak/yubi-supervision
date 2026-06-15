@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import queue
 import sys
 import threading
@@ -42,7 +43,19 @@ from backend.identity_vision import (
     apply_identity_labels,
     collect_person_hints,
 )
-from backend.sources import ResolvedSource, classify_source, resolve_source
+from backend.live_capture import (
+    FfmpegPipeReader,
+    LatestFrameSlot,
+    OpenCvReader,
+    ffmpeg_available,
+    open_ffmpeg_pipe,
+)
+from backend.sources import (
+    ResolvedSource,
+    classify_source,
+    refresh_youtube_live_stream,
+    resolve_source,
+)
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -90,25 +103,31 @@ CAMERA_ERROR = (
     "(Terminal or Python), close other apps using the camera, then click Retry."
 )
 
+# Remote live feeds: lighter MJPEG publish + processing dimensions.
+LIVE_REMOTE_MAX_WIDTH = 960
+
+
+def _enable_ffmpeg_low_latency() -> None:
+    """Reduce HLS/RTSP demuxer buffering inside OpenCV's ffmpeg backend."""
+    key = "OPENCV_FFMPEG_CAPTURE_OPTIONS"
+    if "nobuffer" in os.environ.get(key, ""):
+        return
+    os.environ[key] = "fflags;nobuffer|flags;low_delay|max_delay;500000"
+
 
 class _CaptureWorker:
-    """Dedicated capture thread so ``cap.read()`` never blocks inference.
-
-    Two modes:
-    - ``drop_frames`` (live webcam / RTSP): always keep only the newest frame so
-      inference works on the latest reality and never falls behind.
-    - backpressure (seekable file / clip): block on a full queue so every frame
-      is analyzed; on EOF, optionally seek back to the start for a looping feed.
-    """
+    """Dedicated capture thread — publishes into a ``LatestFrameSlot``."""
 
     def __init__(
         self,
-        cap: cv2.VideoCapture,
+        reader: OpenCvReader | FfmpegPipeReader,
+        slot: LatestFrameSlot,
         *,
         drop_frames: bool = True,
         loop_on_eof: bool = False,
     ) -> None:
-        self._cap = cap
+        self._reader = reader
+        self._slot = slot
         self._drop = drop_frames
         self._loop_on_eof = loop_on_eof
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
@@ -118,7 +137,7 @@ class _CaptureWorker:
 
     @property
     def ended(self) -> bool:
-        return self._ended
+        return self._ended or getattr(self._reader, "ended", False)
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -129,9 +148,12 @@ class _CaptureWorker:
 
     def stop(self) -> None:
         self._running = False
+        interrupt = getattr(self._reader, "interrupt", None)
+        if callable(interrupt):
+            interrupt()
         thread = self._thread
         if thread and thread.is_alive():
-            thread.join(timeout=1.0)
+            thread.join(timeout=8.0)
         self._thread = None
         while not self._queue.empty():
             try:
@@ -140,30 +162,41 @@ class _CaptureWorker:
                 break
 
     def _run(self) -> None:
-        while self._running:
-            ok, frame = self._cap.read()
-            if not ok:
-                if self._loop_on_eof:
-                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    time.sleep(0.005)
-                    continue
-                self._ended = True
-                time.sleep(0.01)
-                continue
-            if self._drop:
-                if self._queue.full():
-                    try:
-                        self._queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                self._queue.put(frame)
-            else:
-                while self._running:
-                    try:
-                        self._queue.put(frame, timeout=0.1)
-                        break
-                    except queue.Full:
+        try:
+            while self._running:
+                ok, frame = self._reader.read()
+                if not ok or frame is None:
+                    if self._loop_on_eof and isinstance(self._reader, OpenCvReader):
+                        time.sleep(0.005)
                         continue
+                    self._ended = True
+                    time.sleep(0.01)
+                    continue
+                self._ended = False
+                self._slot.publish(frame)
+                if self._drop:
+                    if self._queue.full():
+                        try:
+                            self._queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                    self._queue.put(frame)
+                else:
+                    while self._running:
+                        try:
+                            self._queue.put(frame, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
+        finally:
+            # OpenCV/ffmpeg must be released on the capture thread to avoid macOS SIGSEGV.
+            try:
+                self._reader.release()
+            except Exception:
+                pass
+
+    def snapshot_frame(self) -> tuple[int, np.ndarray | None]:
+        return self._slot.snapshot()
 
     def read_latest(self, timeout: float = 0.05) -> tuple[bool, np.ndarray | None]:
         try:
@@ -462,6 +495,8 @@ class VisionStats:
     uptime_sec: float = 0.0
     source_label: str = ""
     source_kind: str = ""
+    stream_frame_seq: int = 0
+    stream_fps: float = 0.0
 
 
 class VisionEngine:
@@ -473,6 +508,10 @@ class VisionEngine:
         self._thread: threading.Thread | None = None
         self._bootstrap_thread: threading.Thread | None = None
         self._latest_jpeg: bytes | None = None
+        self._stream_jpeg: bytes | None = None
+        self._stream_frame_seq = 0
+        self._stream_fps = 0.0
+        self._annotated_jpeg: bytes | None = None
         self._stats = VisionStats()
         self._config = VisionConfig(
             confidence=self._settings.default_confidence,
@@ -488,8 +527,13 @@ class VisionEngine:
         self._source_request: str | None = None
         self._source_label = ""
         self._source_kind = ""
+        self._source_is_live = False
         self._source_cleanup_path: str | None = None
-        self._cap: cv2.VideoCapture | None = None
+        self._stream_width: int | None = None
+        self._stream_height: int | None = None
+        self._prefer_ffmpeg_pipe = False
+        self._frame_slot = LatestFrameSlot()
+        self._frame_reader: OpenCvReader | FfmpegPipeReader | None = None
         self._capture_worker: _CaptureWorker | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
         self._face: mp.tasks.vision.FaceLandmarker | None = None
@@ -509,6 +553,13 @@ class VisionEngine:
         self._frame_index = 0
         self._loop_last_tick = 0.0
         self._loop_error_streak = 0
+        self._last_youtube_reconnect_at = 0.0
+        self._preview_running = False
+        self._preview_thread: threading.Thread | None = None
+        self._last_infer_at = 0.0
+        self._last_infer_seq = 0
+        self._last_stream_encoded_seq = 0
+        self._stream_fps_clock = time.perf_counter()
         self._palette = sv.ColorPalette.from_hex([
             "#B8A48C",
             "#8FA89A",
@@ -577,9 +628,18 @@ class VisionEngine:
         with self._lock:
             return self._starting
 
+    def _is_remote_live_stream(self) -> bool:
+        return self._source_kind in {"youtube", "stream"}
+
     def get_latest_jpeg(self) -> bytes | None:
         with self._lock:
-            return self._latest_jpeg
+            if self._is_remote_live_stream():
+                return self._stream_jpeg
+            return self._latest_jpeg or self._annotated_jpeg
+
+    def get_stream_frame_seq(self) -> int:
+        with self._lock:
+            return self._stream_frame_seq
 
     @staticmethod
     def _clone_config(config: VisionConfig) -> VisionConfig:
@@ -666,10 +726,16 @@ class VisionEngine:
                 uptime_sec=uptime,
                 source_label=self._source_label,
                 source_kind=self._source_kind,
+                stream_frame_seq=self._stream_frame_seq,
+                stream_fps=self._stream_fps,
             )
 
     def get_snapshot(self) -> tuple[bytes, dict] | None:
-        jpeg = self.get_latest_jpeg()
+        with self._lock:
+            if self._is_remote_live_stream():
+                jpeg = self._annotated_jpeg or self._stream_jpeg
+            else:
+                jpeg = self._latest_jpeg or self._annotated_jpeg
         if not jpeg:
             return None
         img = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
@@ -749,8 +815,54 @@ class VisionEngine:
         with self._lock:
             self._stats = VisionStats(state="starting", startup_message=message)
 
-    def _open_source(self) -> tuple[ResolvedSource, cv2.VideoCapture]:
-        """Resolve the requested source and open a VideoCapture for it.
+    def _apply_live_remote_lite(self) -> None:
+        if not self._settings.live_remote_lite:
+            return
+        self._config.show_pose = False
+        self._config.show_face = False
+        self._config.show_hands = False
+        self._config.show_expressions = False
+        self._config.show_masks = False
+        self._config.show_pose_labels = False
+        self._config.show_identity = False
+        self._config.show_gemini = False
+
+    def _open_live_reader(
+        self, resolved: ResolvedSource
+    ) -> OpenCvReader | FfmpegPipeReader:
+        if (
+            resolved.prefer_ffmpeg_pipe
+            and resolved.stream_width
+            and resolved.stream_height
+            and ffmpeg_available()
+        ):
+            try:
+                return open_ffmpeg_pipe(
+                    str(resolved.target),
+                    resolved.stream_width,
+                    resolved.stream_height,
+                )
+            except Exception as exc:
+                print(f"ffmpeg pipe unavailable, falling back to OpenCV: {exc}")
+
+        _enable_ffmpeg_low_latency()
+        cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open source: {resolved.label}")
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError(f"Could not read frames from source: {resolved.label}")
+        if not resolved.is_live:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._tune_capture(cap)
+        return OpenCvReader(cap)
+
+    def _open_source(
+        self,
+    ) -> tuple[ResolvedSource, OpenCvReader | FfmpegPipeReader]:
+        """Resolve the requested source and open a frame reader.
 
         Runs in the bootstrap thread (YouTube resolution may block on network).
         """
@@ -760,7 +872,7 @@ class VisionEngine:
             else self._settings.camera_source
         )
         if classify_source(raw) == "youtube":
-            self._set_startup_message("Downloading YouTube clip…")
+            self._set_startup_message("Resolving YouTube source…")
         resolved = resolve_source(
             raw,
             camera_index=self._settings.camera_index,
@@ -773,20 +885,28 @@ class VisionEngine:
 
         if resolved.kind == "webcam":
             cap = self._open_webcam(int(resolved.target))
-        else:
-            cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
-            if not cap.isOpened():
-                cap.release()
-                raise RuntimeError(f"Could not open source: {resolved.label}")
-            ok, _ = cap.read()
-            if not ok:
-                cap.release()
-                raise RuntimeError(
-                    f"Could not read frames from source: {resolved.label}"
-                )
+            return resolved, OpenCvReader(cap)
+
+        if resolved.is_live and resolved.prefer_ffmpeg_pipe:
+            self._set_startup_message("Opening live stream (ffmpeg)…")
+            return resolved, self._open_live_reader(resolved)
+
+        if resolved.is_live:
+            _enable_ffmpeg_low_latency()
+        cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open source: {resolved.label}")
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError(
+                f"Could not read frames from source: {resolved.label}"
+            )
+        if not resolved.is_live:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            self._tune_capture(cap)
-        return resolved, cap
+        self._tune_capture(cap)
+        return resolved, OpenCvReader(cap)
 
     def _open_webcam(self, index: int) -> cv2.VideoCapture:
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
@@ -827,7 +947,7 @@ class VisionEngine:
 
     def _start_capture_worker(
         self,
-        cap: cv2.VideoCapture,
+        reader: OpenCvReader | FfmpegPipeReader,
         *,
         drop_frames: bool = True,
         loop_on_eof: bool = False,
@@ -835,16 +955,133 @@ class VisionEngine:
         if self._capture_worker is not None:
             self._capture_worker.stop()
         self._capture_worker = _CaptureWorker(
-            cap, drop_frames=drop_frames, loop_on_eof=loop_on_eof
+            reader,
+            self._frame_slot,
+            drop_frames=drop_frames,
+            loop_on_eof=loop_on_eof,
         )
         self._capture_worker.start()
+
+    def _replace_capture(
+        self,
+        reader: OpenCvReader | FfmpegPipeReader,
+        *,
+        drop_frames: bool = True,
+        loop_on_eof: bool = False,
+    ) -> None:
+        """Swap capture devices without releasing while the reader thread is active."""
+        self._stop_capture_worker()
+        self._frame_reader = reader
+        self._start_capture_worker(
+            reader, drop_frames=drop_frames, loop_on_eof=loop_on_eof
+        )
 
     def _stop_capture_worker(self) -> None:
         if self._capture_worker is not None:
             self._capture_worker.stop()
             self._capture_worker = None
 
-    def _quick_reopen_camera(self) -> cv2.VideoCapture | None:
+    def _stop_live_preview(self) -> None:
+        self._preview_running = False
+        thread = self._preview_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._preview_thread = None
+
+    def _stream_publisher_loop(self) -> None:
+        interval = 1.0 / max(1, self._settings.live_stream_fps)
+        quality = self._settings.stream_jpeg_quality
+        last_seq = 0
+        while self._preview_running:
+            loop_start = time.perf_counter()
+            with self._lock:
+                if not self._running:
+                    break
+                capture = self._capture_worker
+            if capture is None:
+                time.sleep(0.05)
+                continue
+            seq, frame = capture.snapshot_frame()
+            if seq > last_seq and frame is not None:
+                preview = encode_frame_jpeg(
+                    frame,
+                    max_width=LIVE_REMOTE_MAX_WIDTH,
+                    quality=quality,
+                )
+                if preview:
+                    with self._lock:
+                        self._stream_jpeg = preview
+                        self._stream_frame_seq = seq
+                        now = time.perf_counter()
+                        elapsed = now - self._stream_fps_clock
+                        self._stream_fps_clock = now
+                        if elapsed > 0:
+                            self._stream_fps = round(
+                                0.85 * self._stream_fps + 0.15 * (1.0 / elapsed), 1
+                            )
+                    last_seq = seq
+            elapsed = time.perf_counter() - loop_start
+            time.sleep(max(0.0, interval - elapsed))
+
+    def _start_live_preview(self) -> None:
+        self._stop_live_preview()
+        self._last_stream_encoded_seq = 0
+        self._stream_fps_clock = time.perf_counter()
+        self._preview_running = True
+        self._preview_thread = threading.Thread(
+            target=self._stream_publisher_loop,
+            name="yubi-stream-publisher",
+            daemon=True,
+        )
+        self._preview_thread.start()
+
+    def _processing_max_width(self) -> int:
+        if self._source_kind in {"youtube", "stream"}:
+            return min(self._settings.processing_max_width, LIVE_REMOTE_MAX_WIDTH)
+        return self._settings.processing_max_width
+
+    def _quick_reopen_youtube_live(self) -> OpenCvReader | FfmpegPipeReader | None:
+        if self._source_kind != "youtube" or not self._source_is_live:
+            return None
+        raw = (
+            self._source_request
+            if self._source_request is not None
+            else self._settings.camera_source
+        )
+        if classify_source(raw) != "youtube":
+            return None
+        try:
+            stream_url = refresh_youtube_live_stream(raw)
+        except Exception as exc:
+            print(f"YouTube live refresh failed: {exc}")
+            return None
+
+        if (
+            self._prefer_ffmpeg_pipe
+            and self._stream_width
+            and self._stream_height
+            and ffmpeg_available()
+        ):
+            try:
+                return open_ffmpeg_pipe(
+                    stream_url, self._stream_width, self._stream_height
+                )
+            except Exception as exc:
+                print(f"YouTube ffmpeg refresh failed: {exc}")
+
+        _enable_ffmpeg_low_latency()
+        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            cap.release()
+            return None
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            return None
+        self._tune_capture(cap)
+        return OpenCvReader(cap)
+
+    def _quick_reopen_camera(self) -> OpenCvReader | None:
         if self._source_kind != "webcam":
             return None
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
@@ -855,7 +1092,7 @@ class VisionEngine:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, self._settings.camera_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self._settings.camera_height)
         self._tune_capture(cap)
-        return cap
+        return OpenCvReader(cap)
 
     def start_async(self, source: str | None = None) -> None:
         with self._lock:
@@ -883,7 +1120,7 @@ class VisionEngine:
             return self._starting
 
     def _bootstrap(self) -> None:
-        cap = None
+        reader: OpenCvReader | FfmpegPipeReader | None = None
         pose = None
         face = None
         hand = None
@@ -902,14 +1139,20 @@ class VisionEngine:
                 return
 
             self._set_startup_message("Opening input source…")
-            resolved, cap = self._open_source()
+            resolved, reader = self._open_source()
             with self._lock:
                 self._source_label = resolved.label
                 self._source_kind = resolved.kind
+                self._source_is_live = resolved.is_live
                 self._source_cleanup_path = resolved.cleanup_path
+                self._stream_width = resolved.stream_width
+                self._stream_height = resolved.stream_height
+                self._prefer_ffmpeg_pipe = resolved.prefer_ffmpeg_pipe
+                if resolved.is_live and resolved.kind in {"youtube", "stream"}:
+                    self._apply_live_remote_lite()
 
             if not self._still_starting():
-                cap.release()
+                reader.release()
                 return
 
             self._set_startup_message("Loading pose, face, and hand models…")
@@ -959,7 +1202,7 @@ class VisionEngine:
                 degraded.append("hands")
 
             if not self._still_starting():
-                self._release_models(cap, pose, face, hand)
+                self._release_models(reader, pose, face, hand)
                 return
 
             self._set_startup_message("Loading object detection model…")
@@ -977,14 +1220,16 @@ class VisionEngine:
 
             with self._lock:
                 if not self._starting:
-                    self._release_models(cap, pose, face, hand)
+                    self._release_models(reader, pose, face, hand)
                     return
-                self._cap = cap
+                self._frame_reader = reader
                 self._start_capture_worker(
-                    cap,
+                    reader,
                     drop_frames=resolved.is_live,
                     loop_on_eof=(not resolved.is_live) and self._settings.source_loop,
                 )
+                if resolved.kind in {"youtube", "stream"}:
+                    self._start_live_preview()
                 self._pose = pose
                 self._face = face
                 self._hand = hand
@@ -993,6 +1238,12 @@ class VisionEngine:
                 self._running = True
                 self._starting = False
                 self._latest_jpeg = None
+                self._stream_jpeg = None
+                self._stream_frame_seq = 0
+                self._stream_fps = 0.0
+                self._annotated_jpeg = None
+                self._last_infer_seq = 0
+                self._last_infer_at = 0.0
                 self._live_since = time.time()
                 self._frame_index = 0
                 self._loop_last_tick = time.time()
@@ -1005,16 +1256,21 @@ class VisionEngine:
             self._identity.start()
             self._expression.set_active(self._config.show_expressions)
         except Exception as exc:
-            self._release_models(cap, pose, face, hand)
+            self._release_models(reader, pose, face, hand)
             with self._lock:
                 self._starting = False
                 self._running = False
                 self._stats = VisionStats(state="error", error=str(exc))
 
     @staticmethod
-    def _release_models(cap, pose, face, hand) -> None:
-        if cap is not None:
-            cap.release()
+    def _release_models(
+        reader: OpenCvReader | FfmpegPipeReader | None,
+        pose,
+        face,
+        hand,
+    ) -> None:
+        if reader is not None:
+            reader.release()
         if pose is not None:
             pose.close()
         if face is not None:
@@ -1032,31 +1288,39 @@ class VisionEngine:
         self._expression.set_active(False)
         self._micro_tracker.reset()
         self._track_labels.reset()
+        self._stop_live_preview()
+
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5.0)
+        self._thread = None
+
         self._stop_capture_worker()
 
         if self._bootstrap_thread and self._bootstrap_thread.is_alive():
             self._bootstrap_thread.join(timeout=3.0)
         self._bootstrap_thread = None
 
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-        self._thread = None
-
         cleanup_path = None
         with self._lock:
             cleanup_path = self._source_cleanup_path
             self._source_cleanup_path = None
-            self._release_models(self._cap, self._pose, self._face, self._hand)
-            self._cap = None
+            # Reader is released on the capture thread; do not release again here.
+            self._release_models(None, self._pose, self._face, self._hand)
+            self._frame_reader = None
             self._pose = None
             self._face = None
             self._hand = None
             self._yolo = None
             self._latest_jpeg = None
+            self._stream_jpeg = None
+            self._stream_frame_seq = 0
+            self._stream_fps = 0.0
+            self._annotated_jpeg = None
             self._live_since = None
             self._frame_index = 0
             self._source_label = ""
             self._source_kind = ""
+            self._source_is_live = False
             self._stats = VisionStats(state="idle")
 
         if cleanup_path:
@@ -1098,33 +1362,68 @@ class VisionEngine:
                 if not self._running:
                     break
                 capture = self._capture_worker
-                cap = self._cap
                 pose = self._pose
                 face = self._face
                 hand = self._hand
                 yolo = self._yolo
                 config = self._clone_config(self._config)
 
-            if capture is None or cap is None:
+            if capture is None or self._frame_reader is None:
                 break
 
-            ok, frame = capture.read_latest()
+            if self._is_remote_live_stream():
+                seq, frame = capture.snapshot_frame()
+                if frame is None:
+                    ok = False
+                else:
+                    ok = True
+                    min_gap = 1.0 / max(0.5, self._settings.live_inference_fps)
+                    now = time.time()
+                    if seq == self._last_infer_seq or now - self._last_infer_at < min_gap:
+                        time.sleep(0.01)
+                        continue
+                    self._last_infer_at = now
+                    self._last_infer_seq = seq
+            else:
+                ok, frame = capture.read_latest()
             if not ok or frame is None:
+                if (
+                    capture.ended
+                    and self._source_kind == "youtube"
+                    and self._source_is_live
+                ):
+                    now = time.time()
+                    if now - self._last_youtube_reconnect_at >= 15.0:
+                        self._last_youtube_reconnect_at = now
+                        new_reader = self._quick_reopen_youtube_live()
+                        if new_reader is not None:
+                            self._replace_capture(
+                                new_reader, drop_frames=True, loop_on_eof=False
+                            )
+                            capture = self._capture_worker
+                            read_failures = 0
+                            if not self._preview_running:
+                                self._start_live_preview()
+                            continue
+
                 # A non-looping clip that has played out: end the session cleanly.
-                if capture.ended:
+                if capture.ended and not self._source_is_live:
                     with self._lock:
                         self._running = False
                         self._stats = VisionStats(state="idle", degraded=degraded)
                     break
+
+                # Live HLS/RTSP often blocks in ffmpeg — an empty queue is normal;
+                # never release capture from here (that races the reader thread).
+                if self._source_is_live or self._source_kind == "stream":
+                    time.sleep(0.02)
+                    continue
+
                 read_failures += 1
-                if self._source_kind == "webcam" and read_failures == 12:
-                    cap.release()
-                    new_cap = self._quick_reopen_camera()
-                    if new_cap is not None:
-                        self._start_capture_worker(new_cap, drop_frames=True)
-                        with self._lock:
-                            self._cap = new_cap
-                        cap = new_cap
+                if read_failures == 12 and self._source_kind == "webcam":
+                    new_reader = self._quick_reopen_camera()
+                    if new_reader is not None:
+                        self._replace_capture(new_reader, drop_frames=True)
                         capture = self._capture_worker
                         read_failures = 0
                         continue
@@ -1143,7 +1442,7 @@ class VisionEngine:
 
             try:
                 read_failures = 0
-                frame = downscale_frame(frame, self._settings.processing_max_width)
+                frame = downscale_frame(frame, self._processing_max_width())
                 height, width = frame.shape[:2]
 
                 analysis_jpeg: bytes | None = None
@@ -1403,7 +1702,9 @@ class VisionEngine:
                     track_items = list_tracked_objects(detections, class_names)
                 alert_items = self._fire_alerts(object_summary)
                 with self._lock:
-                    self._latest_jpeg = jpeg_bytes
+                    self._annotated_jpeg = jpeg_bytes
+                    if not self._is_remote_live_stream():
+                        self._latest_jpeg = jpeg_bytes
                     self._stats = VisionStats(
                         state="live",
                         face_count=(

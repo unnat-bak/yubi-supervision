@@ -144,6 +144,8 @@ async def status() -> StatusResponse:
         uptime_sec=stats.uptime_sec,
         source_label=stats.source_label,
         source_kind=stats.source_kind,
+        stream_frame_seq=stats.stream_frame_seq,
+        stream_fps=stats.stream_fps,
     )
 
 
@@ -264,10 +266,17 @@ async def session_report_stream_endpoint(
 
 
 async def mjpeg_stream():
+    last_stream_seq = 0
     while engine.is_running or engine.is_starting:
         if engine.is_running:
             jpeg = engine.get_latest_jpeg()
             if jpeg:
+                seq = engine.get_stream_frame_seq()
+                if seq and seq == last_stream_seq:
+                    await asyncio.sleep(0.016)
+                    continue
+                if seq:
+                    last_stream_seq = seq
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"

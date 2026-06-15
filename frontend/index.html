@@ -38,7 +38,7 @@
               type="text"
               autocomplete="off"
               spellcheck="false"
-              placeholder="Webcam — or paste a video file, YouTube, or RTSP URL"
+              placeholder="Webcam — or paste a video file, YouTube (live/VOD), or RTSP URL"
             />
             <p class="source-hint">Leave blank for the server webcam</p>
             <p id="source-cache-hint" class="source-hint source-cache-hint" hidden></p>
@@ -48,9 +48,15 @@
         <div id="session-log-actions" class="session-log-actions intel-panel" hidden>
           <p class="session-log-title">Session complete</p>
           <p id="session-log-summary" class="session-log-summary"></p>
+          <p class="session-log-hint">
+            Download a compact raw log now, or run YUBI v3.0 enrichment for an intelligence brief.
+          </p>
           <div class="session-log-buttons">
-            <button id="btn-download-log" type="button" class="btn btn-primary">
-              Download session report
+            <button id="btn-download-raw" type="button" class="btn btn-primary">
+              Download raw log
+            </button>
+            <button id="btn-download-enriched" type="button" class="btn btn-secondary">
+              Enrich with YUBI v3.0
             </button>
             <button id="btn-dismiss-log" type="button" class="btn btn-secondary btn-ghost">
               Dismiss

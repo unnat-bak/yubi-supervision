@@ -11,11 +11,12 @@ index.html / app.js             main.py                            _bootstrap th
   ├─ poll GET /api/status       ├─ routes only                     ├─ download .task / YOLO
   ├─ POST /api/config           ├─ VisionEngine singleton          ├─ open VideoCapture
   ├─ POST /api/start/stop       └─ StreamingResponse /api/stream   └─ spawn _loop thread
-  └─ img GET /api/stream              reads _latest_jpeg                 ├─ read frame
-                                                                      ├─ MediaPipe + YOLO
+  └─ img GET /api/stream              reads stream/preview JPEG           ├─ read frame (capture thread)
+                                                                      ├─ stream publisher (remote live)
+                                                                      ├─ MediaPipe + YOLO (throttled on live)
                                                                       ├─ v3.0 reconcile
                                                                       ├─ micro-expressions
-                                                                      └─ encode JPEG
+                                                                      └─ encode annotated JPEG (not MJPEG on live remote)
 
 YUBI v3.0 (gemini_vision.py)    ExpressionEnricher (expression_vision.py)
   └─ periodic GenAI calls         └─ periodic face-crop GenAI calls
@@ -23,6 +24,17 @@ YUBI v3.0 (gemini_vision.py)    ExpressionEnricher (expression_vision.py)
 ```
 
 **Webcam capture is server-side** (OpenCV). The browser only displays JPEGs from `/api/stream`.
+
+### Remote live (YouTube / RTSP)
+
+For `source_kind` of `youtube` or `stream`, MJPEG is **decoupled from inference**:
+
+- **Capture thread** publishes frames into a `LatestFrameSlot` (sequence id + BGR buffer).
+- **Stream publisher thread** encodes fresh JPEGs at `LIVE_STREAM_FPS` into `_stream_jpeg`; `/api/stream` always serves this buffer.
+- **Inference thread** snapshots frames at `LIVE_INFERENCE_FPS` (default 2 fps); annotated JPEGs update `/api/status` only.
+- YouTube live HLS prefers an **ffmpeg pipe** (`backend/live_capture.py`) with OpenCV fallback.
+
+Frontend stall recovery uses `stream_frame_seq` / `stream_fps`, not inference `frame_index`.
 
 ## Feature matrix
 
@@ -177,6 +189,9 @@ Environment variables load via `backend/config.py` (see `.env.example`).
 | `CAMERA_TIMEOUT_SEC` | `12` | Open timeout |
 | `PROCESSING_MAX_WIDTH` | `1280` | Downscale before inference |
 | `STREAM_JPEG_QUALITY` | `80` | MJPEG encode quality |
+| `LIVE_STREAM_FPS` | `20` | MJPEG publisher rate for YouTube/RTSP |
+| `LIVE_INFERENCE_FPS` | `2.0` | Max inference rate for remote live |
+| `LIVE_REMOTE_LITE` | `true` | Objects-only layers on remote live startup |
 
 ### YOLO
 
