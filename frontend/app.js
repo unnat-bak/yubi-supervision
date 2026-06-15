@@ -106,6 +106,10 @@ const MAX_FPS_HISTORY = 48;
 const videoWrap = document.getElementById("video-wrap");
 const btnFocus = document.getElementById("btn-focus");
 const btnClean = document.getElementById("btn-clean");
+const leftRail = document.getElementById("left-rail");
+const rightRail = document.getElementById("right-rail");
+const toggleLeftPanel = document.getElementById("toggle-left-panel");
+const toggleRightPanel = document.getElementById("toggle-right-panel");
 const sourceCacheHint = document.getElementById("source-cache-hint");
 
 const PIPE_LAYER_MAP = {
@@ -124,6 +128,8 @@ const OVERLAY_LAYER_KEYS = Object.values(PIPE_LAYER_MAP);
 
 let lastLiveConfig = null;
 let focusMode = false;
+let leftPanelCollapsed = false;
+let rightPanelCollapsed = false;
 let cleanFeedMode = false;
 let savedOverlayConfig = null;
 let youtubeCacheDir = "";
@@ -772,6 +778,62 @@ function setLiveControls(enabled) {
   if (btnClean) btnClean.disabled = !enabled;
 }
 
+function loadPanelCollapsePrefs() {
+  try {
+    leftPanelCollapsed = localStorage.getItem("yubi-panel-left") === "1";
+    rightPanelCollapsed = localStorage.getItem("yubi-panel-right") === "1";
+  } catch {
+    leftPanelCollapsed = false;
+    rightPanelCollapsed = false;
+  }
+}
+
+function savePanelCollapsePrefs() {
+  try {
+    localStorage.setItem("yubi-panel-left", leftPanelCollapsed ? "1" : "0");
+    localStorage.setItem("yubi-panel-right", rightPanelCollapsed ? "1" : "0");
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function applyPanelCollapse() {
+  if (leftRail) {
+    leftRail.classList.toggle("collapsed", leftPanelCollapsed);
+  }
+  if (rightRail) {
+    rightRail.classList.toggle("collapsed", rightPanelCollapsed);
+  }
+  if (toggleLeftPanel) {
+    const expanded = !leftPanelCollapsed;
+    toggleLeftPanel.setAttribute("aria-expanded", String(expanded));
+    toggleLeftPanel.title = expanded
+      ? "Collapse object registry"
+      : "Expand object registry";
+  }
+  if (toggleRightPanel) {
+    const expanded = !rightPanelCollapsed;
+    toggleRightPanel.setAttribute("aria-expanded", String(expanded));
+    toggleRightPanel.title = expanded
+      ? "Collapse intelligence panel"
+      : "Expand intelligence panel";
+  }
+}
+
+function toggleLeftPanelCollapse() {
+  if (!isLive || focusMode) return;
+  leftPanelCollapsed = !leftPanelCollapsed;
+  savePanelCollapsePrefs();
+  applyPanelCollapse();
+}
+
+function toggleRightPanelCollapse() {
+  if (!isLive || focusMode) return;
+  rightPanelCollapsed = !rightPanelCollapsed;
+  savePanelCollapsePrefs();
+  applyPanelCollapse();
+}
+
 function applyFocusMode() {
   if (videoWrap) {
     videoWrap.classList.toggle("cinema-mode", focusMode);
@@ -779,6 +841,9 @@ function applyFocusMode() {
   if (btnFocus) {
     btnFocus.classList.toggle("active", focusMode);
     btnFocus.textContent = focusMode ? "Panels" : "Focus";
+  }
+  if (!focusMode) {
+    applyPanelCollapse();
   }
 }
 
@@ -898,6 +963,8 @@ function applyLiveUI() {
   btnStart.disabled = true;
   setLiveControls(true);
   statsBar.hidden = false;
+  if (leftRail) leftRail.hidden = false;
+  if (rightRail) rightRail.hidden = false;
   detectionsPanel.hidden = false;
   hudOverlay.hidden = false;
   pipelineRail.hidden = false;
@@ -912,6 +979,7 @@ function applyLiveUI() {
   }
   if (btnFocus) btnFocus.disabled = false;
   if (btnClean) btnClean.disabled = false;
+  applyPanelCollapse();
 }
 
 function setError(message) {
@@ -1348,6 +1416,8 @@ function setIdle() {
   idleOverlay.classList.remove("hidden");
   statsBar.hidden = true;
   detectionsPanel.hidden = true;
+  if (leftRail) leftRail.hidden = true;
+  if (rightRail) rightRail.hidden = true;
   hudOverlay.hidden = true;
   pipelineRail.hidden = true;
   expressionPanel.hidden = true;
@@ -1641,6 +1711,12 @@ async function toggleRecording() {
 
 btnStart.addEventListener("click", startVision);
 btnStop.addEventListener("click", stopVision);
+if (toggleLeftPanel) {
+  toggleLeftPanel.addEventListener("click", toggleLeftPanelCollapse);
+}
+if (toggleRightPanel) {
+  toggleRightPanel.addEventListener("click", toggleRightPanelCollapse);
+}
 btnSnapshot.addEventListener("click", takeSnapshot);
 btnRecord.addEventListener("click", toggleRecording);
 btnRetry.addEventListener("click", retryVision);
@@ -1800,5 +1876,7 @@ function restoreSavedSource() {
 }
 
 restoreSavedSource();
+loadPanelCollapsePrefs();
+applyPanelCollapse();
 hydrateFromServer();
 startTelemetryClock();
