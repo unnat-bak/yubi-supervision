@@ -167,8 +167,9 @@ class _CaptureWorker:
                 ok, frame = self._reader.read()
                 if not ok or frame is None:
                     if self._loop_on_eof and isinstance(self._reader, OpenCvReader):
-                        time.sleep(0.005)
-                        continue
+                        if self._reader.seek_to_start():
+                            time.sleep(0.005)
+                            continue
                     self._ended = True
                     time.sleep(0.01)
                     continue
@@ -495,6 +496,7 @@ class VisionStats:
     uptime_sec: float = 0.0
     source_label: str = ""
     source_kind: str = ""
+    source_is_live: bool = False
     stream_frame_seq: int = 0
     stream_fps: float = 0.0
 
@@ -529,6 +531,7 @@ class VisionEngine:
         self._source_kind = ""
         self._source_is_live = False
         self._source_cleanup_path: str | None = None
+        self._webcam_index = self._settings.camera_index
         self._stream_width: int | None = None
         self._stream_height: int | None = None
         self._prefer_ffmpeg_pipe = False
@@ -629,7 +632,7 @@ class VisionEngine:
             return self._starting
 
     def _is_remote_live_stream(self) -> bool:
-        return self._source_kind in {"youtube", "stream"}
+        return self._source_is_live and self._source_kind in {"youtube", "stream"}
 
     def get_latest_jpeg(self) -> bytes | None:
         with self._lock:
@@ -726,6 +729,7 @@ class VisionEngine:
                 uptime_sec=uptime,
                 source_label=self._source_label,
                 source_kind=self._source_kind,
+                source_is_live=self._source_is_live,
                 stream_frame_seq=self._stream_frame_seq,
                 stream_fps=self._stream_fps,
             )
@@ -827,6 +831,66 @@ class VisionEngine:
         self._config.show_identity = False
         self._config.show_gemini = False
 
+    def _end_session_from_loop(self, *, error: str | None = None) -> None:
+        """Release capture and models when the inference loop exits unexpectedly."""
+        self._stop_live_preview()
+        self._gemini.stop()
+        self._identity.stop()
+        self._expression.set_active(False)
+        self._stop_capture_worker()
+        with self._lock:
+            degraded = list(self._stats.degraded)
+            self._release_models(None, self._pose, self._face, self._hand)
+            self._frame_reader = None
+            self._pose = None
+            self._face = None
+            self._hand = None
+            self._yolo = None
+            self._running = False
+            if error:
+                self._stats = VisionStats(state="error", error=error, degraded=degraded)
+            else:
+                self._stats = VisionStats(state="idle", degraded=degraded)
+
+    def _reap_zombie_session(self) -> None:
+        """Clean up a prior session that ended without ``stop()`` (e.g. clip EOF)."""
+        self._stop_live_preview()
+        self._gemini.stop()
+        self._identity.stop()
+        self._expression.set_active(False)
+        self._stop_capture_worker()
+        with self._lock:
+            if self._thread and not self._thread.is_alive():
+                self._thread = None
+            self._release_models(None, self._pose, self._face, self._hand)
+            self._frame_reader = None
+            self._pose = None
+            self._face = None
+            self._hand = None
+            self._yolo = None
+            self._running = False
+
+    def _open_video_capture(self, resolved: ResolvedSource) -> cv2.VideoCapture:
+        target = str(resolved.target)
+        if resolved.is_live:
+            _enable_ffmpeg_low_latency()
+            cap = cv2.VideoCapture(target, cv2.CAP_FFMPEG)
+        else:
+            cap = cv2.VideoCapture(target)
+        if not cap.isOpened():
+            cap.release()
+            raise RuntimeError(f"Could not open source: {resolved.label}")
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            raise RuntimeError(
+                f"Could not read frames from source: {resolved.label}"
+            )
+        if not resolved.is_live:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        self._tune_capture(cap)
+        return cap
+
     def _open_live_reader(
         self, resolved: ResolvedSource
     ) -> OpenCvReader | FfmpegPipeReader:
@@ -845,18 +909,7 @@ class VisionEngine:
             except Exception as exc:
                 print(f"ffmpeg pipe unavailable, falling back to OpenCV: {exc}")
 
-        _enable_ffmpeg_low_latency()
-        cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            cap.release()
-            raise RuntimeError(f"Could not open source: {resolved.label}")
-        ok, _ = cap.read()
-        if not ok:
-            cap.release()
-            raise RuntimeError(f"Could not read frames from source: {resolved.label}")
-        if not resolved.is_live:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self._tune_capture(cap)
+        cap = self._open_video_capture(resolved)
         return OpenCvReader(cap)
 
     def _open_source(
@@ -891,22 +944,7 @@ class VisionEngine:
             self._set_startup_message("Opening live stream (ffmpeg)…")
             return resolved, self._open_live_reader(resolved)
 
-        if resolved.is_live:
-            _enable_ffmpeg_low_latency()
-        cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
-        if not cap.isOpened():
-            cap.release()
-            raise RuntimeError(f"Could not open source: {resolved.label}")
-        ok, _ = cap.read()
-        if not ok:
-            cap.release()
-            raise RuntimeError(
-                f"Could not read frames from source: {resolved.label}"
-            )
-        if not resolved.is_live:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        self._tune_capture(cap)
-        return resolved, OpenCvReader(cap)
+        return resolved, OpenCvReader(self._open_video_capture(resolved))
 
     def _open_webcam(self, index: int) -> cv2.VideoCapture:
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
@@ -1036,7 +1074,7 @@ class VisionEngine:
         self._preview_thread.start()
 
     def _processing_max_width(self) -> int:
-        if self._source_kind in {"youtube", "stream"}:
+        if self._source_is_live and self._source_kind in {"youtube", "stream"}:
             return min(self._settings.processing_max_width, LIVE_REMOTE_MAX_WIDTH)
         return self._settings.processing_max_width
 
@@ -1085,7 +1123,7 @@ class VisionEngine:
         if self._source_kind != "webcam":
             return None
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
-        cap = cv2.VideoCapture(self._settings.camera_index, backend)
+        cap = cv2.VideoCapture(self._webcam_index, backend)
         if not cap.isOpened():
             cap.release()
             return None
@@ -1120,6 +1158,7 @@ class VisionEngine:
             return self._starting
 
     def _bootstrap(self) -> None:
+        self._reap_zombie_session()
         reader: OpenCvReader | FfmpegPipeReader | None = None
         pose = None
         face = None
@@ -1145,6 +1184,8 @@ class VisionEngine:
                 self._source_kind = resolved.kind
                 self._source_is_live = resolved.is_live
                 self._source_cleanup_path = resolved.cleanup_path
+                if resolved.kind == "webcam":
+                    self._webcam_index = int(resolved.target)
                 self._stream_width = resolved.stream_width
                 self._stream_height = resolved.stream_height
                 self._prefer_ffmpeg_pipe = resolved.prefer_ffmpeg_pipe
@@ -1228,7 +1269,7 @@ class VisionEngine:
                     drop_frames=resolved.is_live,
                     loop_on_eof=(not resolved.is_live) and self._settings.source_loop,
                 )
-                if resolved.kind in {"youtube", "stream"}:
+                if resolved.is_live and resolved.kind in {"youtube", "stream"}:
                     self._start_live_preview()
                 self._pose = pose
                 self._face = face
@@ -1321,6 +1362,7 @@ class VisionEngine:
             self._source_label = ""
             self._source_kind = ""
             self._source_is_live = False
+            self._webcam_index = self._settings.camera_index
             self._stats = VisionStats(state="idle")
 
         if cleanup_path:
@@ -1408,14 +1450,12 @@ class VisionEngine:
 
                 # A non-looping clip that has played out: end the session cleanly.
                 if capture.ended and not self._source_is_live:
-                    with self._lock:
-                        self._running = False
-                        self._stats = VisionStats(state="idle", degraded=degraded)
+                    self._end_session_from_loop()
                     break
 
                 # Live HLS/RTSP often blocks in ffmpeg — an empty queue is normal;
                 # never release capture from here (that races the reader thread).
-                if self._source_is_live or self._source_kind == "stream":
+                if self._source_is_live:
                     time.sleep(0.02)
                     continue
 
@@ -1433,9 +1473,7 @@ class VisionEngine:
                         if self._source_kind == "webcam"
                         else f"Lost input source: {self._source_label}"
                     )
-                    with self._lock:
-                        self._running = False
-                        self._stats = VisionStats(state="error", error=message)
+                    self._end_session_from_loop(error=message)
                     break
                 time.sleep(0.02)
                 continue
@@ -1730,12 +1768,9 @@ class VisionEngine:
                 self._loop_error_streak += 1
                 traceback.print_exc()
                 if self._loop_error_streak >= 25:
-                    with self._lock:
-                        self._running = False
-                        self._stats = VisionStats(
-                            state="error",
-                            error="Vision processing fault — check server logs",
-                        )
+                    self._end_session_from_loop(
+                        error="Vision processing fault — check server logs"
+                    )
                     break
                 time.sleep(0.05)
 

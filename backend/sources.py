@@ -117,6 +117,8 @@ def _youtube_is_live(info: dict[str, Any]) -> bool:
     status = info.get("live_status")
     if status == "is_upcoming":
         raise RuntimeError("This YouTube broadcast has not started yet.")
+    if status in {"was_live", "post_live", "not_live", "is_not_live"}:
+        return False
     if status == "is_live" or info.get("is_live"):
         return True
     return False
@@ -145,11 +147,14 @@ def _youtube_playback_url(info: dict[str, Any]) -> str:
 
 def probe_youtube(
     url: str,
-    fmt: str = YOUTUBE_PROBE_FORMAT,
+    fmt: str | None = None,
     timeout_sec: float = 120.0,
 ) -> dict[str, Any]:
     """Extract YouTube metadata without downloading (blocking network call)."""
-    with _youtube_client(timeout_sec, format=fmt) as ydl:
+    extra: dict[str, Any] = {}
+    if fmt:
+        extra["format"] = fmt
+    with _youtube_client(timeout_sec, **extra) as ydl:
         info = ydl.extract_info(url, download=False)
         if info is None:
             raise RuntimeError("Could not read YouTube video (no media found).")
@@ -176,6 +181,7 @@ def download_youtube_clip(
     *,
     cache_dir: Path | None = None,
     cache_max_age_hours: float = 168.0,
+    prefetched_info: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     """Download a YouTube watch URL to a local clip OpenCV can read.
 
@@ -191,7 +197,14 @@ def download_youtube_clip(
             outtmpl=str(out_dir / "%(id)s.%(ext)s"),
             overwrites=True,
         ) as ydl:
-            info = ydl.extract_info(url, download=True)
+            if prefetched_info is not None:
+                info = prefetched_info
+                try:
+                    ydl.process_info(info)
+                except Exception:
+                    info = ydl.extract_info(url, download=True)
+            else:
+                info = ydl.extract_info(url, download=True)
             if info is None:
                 raise RuntimeError("Could not download YouTube video (no media found).")
             path = ydl.prepare_filename(info)
@@ -251,10 +264,15 @@ def resolve_source(
         )
 
     if kind == "youtube":
-        info = probe_youtube(value, fmt=YOUTUBE_PROBE_FORMAT)
+        info = probe_youtube(value)
         title = str(info.get("title") or "YouTube")
         if _youtube_is_live(info):
-            stream_url = _youtube_playback_url(info)
+            try:
+                stream_url = _youtube_playback_url(info)
+            except RuntimeError:
+                info = probe_youtube(value, fmt=YOUTUBE_PROBE_FORMAT)
+                stream_url = _youtube_playback_url(info)
+                title = str(info.get("title") or title)
             sw, sh = fit_stream_dimensions(info.get("width"), info.get("height"))
             return ResolvedSource(
                 kind="youtube",
@@ -272,6 +290,7 @@ def resolve_source(
             youtube_format,
             cache_dir=cache_dir,
             cache_max_age_hours=youtube_cache_max_age_hours,
+            prefetched_info=info,
         )
         return ResolvedSource(
             kind="youtube",

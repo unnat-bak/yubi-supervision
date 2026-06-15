@@ -92,5 +92,6 @@ class StatusResponse(BaseModel):
     uptime_sec: float = 0.0
     source_label: str = ""
     source_kind: str = ""
+    source_is_live: bool = False
     stream_frame_seq: int = 0
     stream_fps: float = 0.0

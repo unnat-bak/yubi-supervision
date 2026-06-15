@@ -586,7 +586,8 @@ function maybeRecoverLiveStream(data) {
   if (!isLive) return;
   const now = Date.now();
   const remoteLive =
-    data.source_kind === "youtube" || data.source_kind === "stream";
+    data.source_is_live &&
+    (data.source_kind === "youtube" || data.source_kind === "stream");
 
   if (remoteLive && data.stream_frame_seq != null) {
     if (data.stream_frame_seq !== lastStreamFrameSeq) {
@@ -1431,6 +1432,13 @@ async function refreshStatus() {
         showSessionLogActions();
       }
       setError(data.error);
+      return;
+    }
+
+    if (data.state === "idle" && isLive) {
+      finalizeSession(data);
+      setIdle();
+      showSessionLogActions();
       return;
     }
 

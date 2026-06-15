@@ -144,6 +144,7 @@ async def status() -> StatusResponse:
         uptime_sec=stats.uptime_sec,
         source_label=stats.source_label,
         source_kind=stats.source_kind,
+        source_is_live=stats.source_is_live,
         stream_frame_seq=stats.stream_frame_seq,
         stream_fps=stats.stream_fps,
     )
