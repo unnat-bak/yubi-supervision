@@ -356,6 +356,48 @@ body {
   color: rgba(255, 255, 255, 0.35);
 }
 
+.source-control {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: 4px auto 14px;
+  max-width: 320px;
+  text-align: left;
+}
+
+.source-label {
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--accent-muted);
+}
+
+.source-input {
+  width: 100%;
+  padding: 8px 10px;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.78rem;
+  color: var(--text, #e8edf2);
+  background: rgba(10, 14, 18, 0.7);
+  border: 1px solid rgba(155, 168, 180, 0.28);
+  border-radius: 6px;
+  outline: none;
+  transition: border-color 0.15s ease;
+}
+
+.source-input:focus {
+  border-color: rgba(143, 168, 154, 0.7);
+}
+
+.source-input::placeholder {
+  color: rgba(255, 255, 255, 0.28);
+}
+
+.source-hint {
+  font-size: 0.68rem;
+  color: rgba(255, 255, 255, 0.3);
+}
+
 .loading-overlay {
   position: absolute;
   inset: 0;

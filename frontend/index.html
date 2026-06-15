@@ -30,6 +30,18 @@
           <p class="idle-mark">YUBI</p>
           <p class="idle-title">Supervision Node</p>
           <p class="idle-sub">Real-time object &amp; biometric vision pipeline</p>
+          <div class="source-control">
+            <label class="source-label" for="source-input">Input source</label>
+            <input
+              id="source-input"
+              class="source-input"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="Webcam — or paste a video file, YouTube, or RTSP URL"
+            />
+            <p class="source-hint">Leave blank for the server webcam</p>
+          </div>
           <p class="idle-hint">Initialize feed · <kbd>Space</kbd></p>
         </div>
         <div id="session-log-actions" class="session-log-actions intel-panel" hidden>
@@ -77,6 +89,10 @@
             <span id="telemetry-session" class="telemetry-v">--------</span>
           </span>
           <span class="telemetry-item">
+            <span class="telemetry-k">SRC</span>
+            <span id="telemetry-source" class="telemetry-v">WEBCAM</span>
+          </span>
+          <span class="telemetry-item">
             <span class="telemetry-k">FRAME</span>
             <span id="telemetry-frame" class="telemetry-v">0</span>
           </span>
@@ -91,6 +107,8 @@
           <span class="pipe-item" data-pipe="face"><span class="pipe-dot"></span>FACE</span>
           <span class="pipe-item" data-pipe="hands"><span class="pipe-dot"></span>HAND</span>
           <span class="pipe-item" data-pipe="expressions"><span class="pipe-dot"></span>EXPR</span>
+          <span class="pipe-item" data-pipe="masks"><span class="pipe-dot"></span>MASK</span>
+          <span class="pipe-item" data-pipe="identity"><span class="pipe-dot"></span>ID</span>
           <span class="pipe-item" data-pipe="v3"><span class="pipe-dot"></span>V3.0</span>
         </div>
         <span id="degraded-badge" class="degraded-badge" hidden></span>
@@ -199,6 +217,9 @@
             <button class="layer-chip active" data-layer="show_face" type="button">Face</button>
             <button class="layer-chip active" data-layer="show_hands" type="button">Hands</button>
             <button class="layer-chip" data-layer="show_expressions" type="button">Expressions</button>
+            <button class="layer-chip" data-layer="show_masks" type="button">Masks</button>
+            <button class="layer-chip" data-layer="show_pose_labels" type="button">Joint tags</button>
+            <button class="layer-chip" data-layer="show_identity" type="button">Identity</button>
             <button class="layer-chip active" data-layer="show_gemini" type="button">YUBI v3.0</button>
           </div>
         </section>

@@ -4,7 +4,6 @@ import time
 
 import numpy as np
 import supervision as sv
-
 from backend.gemini_vision import (
     GeminiInsight,
     GeminiObject,

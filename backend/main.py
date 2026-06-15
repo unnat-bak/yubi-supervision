@@ -5,7 +5,7 @@ import json
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -16,6 +16,7 @@ from backend.schemas import (
     HealthResponse,
     SessionReportRequest,
     SessionReportResponse,
+    StartRequest,
     StartResponse,
     StatusResponse,
 )
@@ -62,12 +63,15 @@ async def update_config(payload: ConfigUpdate) -> dict:
 
 
 @app.post("/api/start", response_model=StartResponse)
-async def start_vision() -> StartResponse:
+async def start_vision(
+    payload: StartRequest = Body(default=StartRequest()),
+) -> StartResponse:
     if engine.is_running:
-        return StartResponse(state="live")
+        return StartResponse(state="live", source_label=engine.source_label)
     if engine.is_starting:
-        return StartResponse(state="starting")
-    engine.start_async()
+        return StartResponse(state="starting", source_label=engine.source_label)
+    source = (payload.source or "").strip() or None
+    engine.start_async(source)
     return StartResponse(state="starting")
 
 
@@ -133,6 +137,8 @@ async def status() -> StatusResponse:
         session_id=stats.session_id,
         frame_index=stats.frame_index,
         uptime_sec=stats.uptime_sec,
+        source_label=stats.source_label,
+        source_kind=stats.source_kind,
     )
 
 

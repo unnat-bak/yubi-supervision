@@ -14,7 +14,21 @@ class ConfigUpdate(BaseModel):
     show_hands: Optional[bool] = None
     show_gemini: Optional[bool] = None
     show_expressions: Optional[bool] = None
+    show_masks: Optional[bool] = None
+    show_pose_labels: Optional[bool] = None
+    show_identity: Optional[bool] = None
     confidence: Optional[float] = Field(default=None, ge=0.1, le=0.95)
+
+
+class StartRequest(BaseModel):
+    """Optional per-session input source.
+
+    `source` may be a local video path, an RTSP/HTTP(S) stream URL, a YouTube
+    URL, or a webcam index ("0"). When omitted, the configured default
+    (CAMERA_SOURCE or webcam) is used.
+    """
+
+    source: Optional[str] = None
 
 
 class GeminiObjectResponse(BaseModel):
@@ -40,6 +54,7 @@ class HealthResponse(BaseModel):
 
 class StartResponse(BaseModel):
     state: str
+    source_label: str = ""
 
 
 class SessionReportRequest(BaseModel):
@@ -74,3 +89,5 @@ class StatusResponse(BaseModel):
     session_id: str = ""
     frame_index: int = 0
     uptime_sec: float = 0.0
+    source_label: str = ""
+    source_kind: str = ""

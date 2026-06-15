@@ -37,6 +37,12 @@ from backend.gemini_vision import (
     normalize_box_2d,
     reconcile_tracked_objects,
 )
+from backend.identity_vision import (
+    IdentityEnricher,
+    apply_identity_labels,
+    collect_person_hints,
+)
+from backend.sources import ResolvedSource, resolve_source
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -62,6 +68,23 @@ HAND_CONNECTIONS = (
     (5, 9), (9, 13), (13, 17),
 )
 
+# Curated BlazePose (MediaPipe, 33-landmark) joints worth labeling — index → tag.
+POSE_LABELS = {
+    0: "head",
+    11: "L shoulder",
+    12: "R shoulder",
+    13: "L elbow",
+    14: "R elbow",
+    15: "L wrist",
+    16: "R wrist",
+    23: "L hip",
+    24: "R hip",
+    25: "L knee",
+    26: "R knee",
+    27: "L ankle",
+    28: "R ankle",
+}
+
 CAMERA_ERROR = (
     "Could not access the webcam. Grant camera permission in System Settings "
     "(Terminal or Python), close other apps using the camera, then click Retry."
@@ -69,13 +92,33 @@ CAMERA_ERROR = (
 
 
 class _CaptureWorker:
-    """Dedicated thread: always drains the camera so cap.read() never blocks inference."""
+    """Dedicated capture thread so ``cap.read()`` never blocks inference.
 
-    def __init__(self, cap: cv2.VideoCapture) -> None:
+    Two modes:
+    - ``drop_frames`` (live webcam / RTSP): always keep only the newest frame so
+      inference works on the latest reality and never falls behind.
+    - backpressure (seekable file / clip): block on a full queue so every frame
+      is analyzed; on EOF, optionally seek back to the start for a looping feed.
+    """
+
+    def __init__(
+        self,
+        cap: cv2.VideoCapture,
+        *,
+        drop_frames: bool = True,
+        loop_on_eof: bool = False,
+    ) -> None:
         self._cap = cap
+        self._drop = drop_frames
+        self._loop_on_eof = loop_on_eof
         self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
         self._running = False
+        self._ended = False
         self._thread: threading.Thread | None = None
+
+    @property
+    def ended(self) -> bool:
+        return self._ended
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -100,14 +143,27 @@ class _CaptureWorker:
         while self._running:
             ok, frame = self._cap.read()
             if not ok:
-                time.sleep(0.002)
+                if self._loop_on_eof:
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    time.sleep(0.005)
+                    continue
+                self._ended = True
+                time.sleep(0.01)
                 continue
-            if self._queue.full():
-                try:
-                    self._queue.get_nowait()
-                except queue.Empty:
-                    pass
-            self._queue.put(frame)
+            if self._drop:
+                if self._queue.full():
+                    try:
+                        self._queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                self._queue.put(frame)
+            else:
+                while self._running:
+                    try:
+                        self._queue.put(frame, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
 
     def read_latest(self, timeout: float = 0.05) -> tuple[bool, np.ndarray | None]:
         try:
@@ -235,6 +291,55 @@ def draw_face_outlines(
     return cv2.addWeighted(overlay, 0.85, scene, 0.15, 0)
 
 
+def draw_pose_labels(
+    scene: np.ndarray,
+    pose_kp: sv.KeyPoints,
+    color: tuple[int, int, int],
+) -> np.ndarray:
+    """Tag curated BlazePose joints (head, shoulders, elbows, …) with text."""
+    if pose_kp.is_empty():
+        return scene
+    height, width = scene.shape[:2]
+    confidence = pose_kp.confidence
+    for person_idx, person in enumerate(pose_kp.xy):
+        for landmark_idx, tag in POSE_LABELS.items():
+            if landmark_idx >= len(person):
+                continue
+            if confidence is not None and person_idx < len(confidence):
+                conf = confidence[person_idx]
+                if landmark_idx < len(conf) and float(conf[landmark_idx]) < 0.3:
+                    continue
+            x, y = person[landmark_idx]
+            px, py = int(x), int(y)
+            if px <= 0 and py <= 0:
+                continue
+            px = max(0, min(width - 1, px))
+            py = max(0, min(height - 1, py))
+            (text_w, text_h), baseline = cv2.getTextSize(
+                tag, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1
+            )
+            bx1 = max(0, px + 4)
+            by2 = max(text_h + baseline, py - 4)
+            cv2.rectangle(
+                scene,
+                (bx1, by2 - text_h - baseline),
+                (bx1 + text_w + 6, by2),
+                color,
+                -1,
+            )
+            cv2.putText(
+                scene,
+                tag,
+                (bx1 + 3, by2 - baseline + 1),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.35,
+                (20, 24, 28),
+                1,
+                cv2.LINE_AA,
+            )
+    return scene
+
+
 def encode_frame_jpeg(
     frame: np.ndarray,
     max_width: int | None = None,
@@ -330,6 +435,9 @@ class VisionConfig:
     show_hands: bool = True
     show_gemini: bool = True
     show_expressions: bool = False
+    show_masks: bool = False
+    show_pose_labels: bool = False
+    show_identity: bool = False
     confidence: float = 0.35
 
 
@@ -352,6 +460,8 @@ class VisionStats:
     session_id: str = ""
     frame_index: int = 0
     uptime_sec: float = 0.0
+    source_label: str = ""
+    source_kind: str = ""
 
 
 class VisionEngine:
@@ -364,11 +474,20 @@ class VisionEngine:
         self._bootstrap_thread: threading.Thread | None = None
         self._latest_jpeg: bytes | None = None
         self._stats = VisionStats()
-        self._config = VisionConfig(confidence=self._settings.default_confidence)
+        self._config = VisionConfig(
+            confidence=self._settings.default_confidence,
+            show_masks=self._settings.show_masks_default,
+            show_pose_labels=self._settings.show_pose_labels_default,
+            show_identity=self._settings.show_identity_default,
+        )
         self._gemini = GeminiEnricher(self._settings)
         self._expression = ExpressionEnricher(self._settings)
+        self._identity = IdentityEnricher(self._settings)
         self._micro_tracker = MicroExpressionTracker()
         self._track_labels = TrackLabelCache(self._settings.gemini_label_cache_sec)
+        self._source_request: str | None = None
+        self._source_label = ""
+        self._source_kind = ""
         self._cap: cv2.VideoCapture | None = None
         self._capture_worker: _CaptureWorker | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
@@ -411,6 +530,11 @@ class VisionEngine:
             color=overlay_mist, thickness=1, edges=HAND_CONNECTIONS
         )
         self._hand_vertex = sv.VertexAnnotator(color=overlay_mist, radius=2)
+        self._mask_annotator = sv.MaskAnnotator(
+            color=self._palette,
+            opacity=0.45,
+            color_lookup=sv.ColorLookup.CLASS,
+        )
         self._box_annotator = sv.BoxAnnotator(
             color=self._palette,
             thickness=1,
@@ -456,17 +580,24 @@ class VisionEngine:
         with self._lock:
             return self._latest_jpeg
 
+    @staticmethod
+    def _clone_config(config: VisionConfig) -> VisionConfig:
+        return VisionConfig(
+            show_objects=config.show_objects,
+            show_pose=config.show_pose,
+            show_face=config.show_face,
+            show_hands=config.show_hands,
+            show_gemini=config.show_gemini,
+            show_expressions=config.show_expressions,
+            show_masks=config.show_masks,
+            show_pose_labels=config.show_pose_labels,
+            show_identity=config.show_identity,
+            confidence=config.confidence,
+        )
+
     def get_config(self) -> VisionConfig:
         with self._lock:
-            return VisionConfig(
-                show_objects=self._config.show_objects,
-                show_pose=self._config.show_pose,
-                show_face=self._config.show_face,
-                show_hands=self._config.show_hands,
-                show_gemini=self._config.show_gemini,
-                show_expressions=self._config.show_expressions,
-                confidence=self._config.confidence,
-            )
+            return self._clone_config(self._config)
 
     def get_gemini_insight(self) -> GeminiInsight:
         return self._gemini.get_insight()
@@ -505,15 +636,9 @@ class VisionEngine:
             self._expression.set_active(self._config.show_expressions)
             if not self._config.show_expressions:
                 self._micro_tracker.reset()
-            return VisionConfig(
-                show_objects=self._config.show_objects,
-                show_pose=self._config.show_pose,
-                show_face=self._config.show_face,
-                show_hands=self._config.show_hands,
-                show_gemini=self._config.show_gemini,
-                show_expressions=self._config.show_expressions,
-                confidence=self._config.confidence,
-            )
+            if not self._config.show_identity:
+                self._identity.cache.reset()
+            return self._clone_config(self._config)
 
     def get_stats(self) -> VisionStats:
         with self._lock:
@@ -538,6 +663,8 @@ class VisionEngine:
                 session_id=self._session_id,
                 frame_index=self._frame_index,
                 uptime_sec=uptime,
+                source_label=self._source_label,
+                source_kind=self._source_kind,
             )
 
     def get_snapshot(self) -> tuple[bytes, dict] | None:
@@ -621,24 +748,39 @@ class VisionEngine:
         with self._lock:
             self._stats = VisionStats(state="starting", startup_message=message)
 
-    def _open_camera(self) -> cv2.VideoCapture:
-        if self._settings.camera_source:
-            cap = cv2.VideoCapture(self._settings.camera_source)
+    def _open_source(self) -> tuple[ResolvedSource, cv2.VideoCapture]:
+        """Resolve the requested source and open a VideoCapture for it.
+
+        Runs in the bootstrap thread (YouTube resolution may block on network).
+        """
+        raw = (
+            self._source_request
+            if self._source_request is not None
+            else self._settings.camera_source
+        )
+        resolved = resolve_source(
+            raw,
+            camera_index=self._settings.camera_index,
+            youtube_format=self._settings.youtube_format,
+        )
+
+        if resolved.kind == "webcam":
+            cap = self._open_webcam(int(resolved.target))
+        else:
+            cap = cv2.VideoCapture(resolved.target)
             if not cap.isOpened():
                 cap.release()
-                raise RuntimeError(
-                    f"Could not open video source: {self._settings.camera_source}"
-                )
+                raise RuntimeError(f"Could not open source: {resolved.label}")
             self._tune_capture(cap)
-            return cap
+        return resolved, cap
 
+    def _open_webcam(self, index: int) -> cv2.VideoCapture:
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
         result: dict[str, cv2.VideoCapture | None] = {"cap": None}
-
         settings = self._settings
 
         def opener() -> None:
-            cap = cv2.VideoCapture(settings.camera_index, backend)
+            cap = cv2.VideoCapture(index, backend)
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.camera_width)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.camera_height)
             if not cap.isOpened():
@@ -669,10 +811,18 @@ class VisionEngine:
     def _tune_capture(cap: cv2.VideoCapture) -> None:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    def _start_capture_worker(self, cap: cv2.VideoCapture) -> None:
+    def _start_capture_worker(
+        self,
+        cap: cv2.VideoCapture,
+        *,
+        drop_frames: bool = True,
+        loop_on_eof: bool = False,
+    ) -> None:
         if self._capture_worker is not None:
             self._capture_worker.stop()
-        self._capture_worker = _CaptureWorker(cap)
+        self._capture_worker = _CaptureWorker(
+            cap, drop_frames=drop_frames, loop_on_eof=loop_on_eof
+        )
         self._capture_worker.start()
 
     def _stop_capture_worker(self) -> None:
@@ -681,7 +831,7 @@ class VisionEngine:
             self._capture_worker = None
 
     def _quick_reopen_camera(self) -> cv2.VideoCapture | None:
-        if self._settings.camera_source:
+        if self._source_kind != "webcam":
             return None
         backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
         cap = cv2.VideoCapture(self._settings.camera_index, backend)
@@ -693,11 +843,12 @@ class VisionEngine:
         self._tune_capture(cap)
         return cap
 
-    def start_async(self) -> None:
+    def start_async(self, source: str | None = None) -> None:
         with self._lock:
             if self._running or self._starting:
                 return
             self._starting = True
+            self._source_request = source
             self._stats = VisionStats(
                 state="starting",
                 startup_message="Preparing vision pipeline…",
@@ -707,6 +858,11 @@ class VisionEngine:
             target=self._bootstrap, daemon=True
         )
         self._bootstrap_thread.start()
+
+    @property
+    def source_label(self) -> str:
+        with self._lock:
+            return self._source_label
 
     def _still_starting(self) -> bool:
         with self._lock:
@@ -718,6 +874,7 @@ class VisionEngine:
         face = None
         hand = None
         yolo = None
+        resolved: ResolvedSource | None = None
         degraded: list[str] = []
         try:
             models_dir = self._settings.models_dir
@@ -730,8 +887,11 @@ class VisionEngine:
             if not self._still_starting():
                 return
 
-            self._set_startup_message("Opening webcam…")
-            cap = self._open_camera()
+            self._set_startup_message("Opening input source…")
+            resolved, cap = self._open_source()
+            with self._lock:
+                self._source_label = resolved.label
+                self._source_kind = resolved.kind
 
             if not self._still_starting():
                 cap.release()
@@ -805,7 +965,11 @@ class VisionEngine:
                     self._release_models(cap, pose, face, hand)
                     return
                 self._cap = cap
-                self._start_capture_worker(cap)
+                self._start_capture_worker(
+                    cap,
+                    drop_frames=resolved.is_live,
+                    loop_on_eof=(not resolved.is_live) and self._settings.source_loop,
+                )
                 self._pose = pose
                 self._face = face
                 self._hand = hand
@@ -823,6 +987,7 @@ class VisionEngine:
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
             self._gemini.start()
+            self._identity.start()
             self._expression.set_active(self._config.show_expressions)
         except Exception as exc:
             self._release_models(cap, pose, face, hand)
@@ -848,6 +1013,7 @@ class VisionEngine:
             self._starting = False
 
         self._gemini.stop()
+        self._identity.stop()
         self._expression.set_active(False)
         self._micro_tracker.reset()
         self._track_labels.reset()
@@ -871,6 +1037,8 @@ class VisionEngine:
             self._latest_jpeg = None
             self._live_since = None
             self._frame_index = 0
+            self._source_label = ""
+            self._source_kind = ""
             self._stats = VisionStats(state="idle")
 
     def _detect_objects(
@@ -911,46 +1079,42 @@ class VisionEngine:
                 face = self._face
                 hand = self._hand
                 yolo = self._yolo
-                config = VisionConfig(
-                    show_objects=self._config.show_objects,
-                    show_pose=self._config.show_pose,
-                    show_face=self._config.show_face,
-                    show_hands=self._config.show_hands,
-                    show_gemini=self._config.show_gemini,
-                    show_expressions=self._config.show_expressions,
-                    confidence=self._config.confidence,
-                )
+                config = self._clone_config(self._config)
 
             if capture is None or cap is None:
                 break
 
             ok, frame = capture.read_latest()
             if not ok or frame is None:
+                # A non-looping clip that has played out: end the session cleanly.
+                if capture.ended:
+                    with self._lock:
+                        self._running = False
+                        self._stats = VisionStats(state="idle", degraded=degraded)
+                    break
                 read_failures += 1
-                if self._settings.camera_source and read_failures < 30:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    time.sleep(0.01)
-                    continue
-                if (
-                    not self._settings.camera_source
-                    and read_failures == 12
-                ):
+                if self._source_kind == "webcam" and read_failures == 12:
                     cap.release()
                     new_cap = self._quick_reopen_camera()
                     if new_cap is not None:
-                        self._start_capture_worker(new_cap)
+                        self._start_capture_worker(new_cap, drop_frames=True)
                         with self._lock:
                             self._cap = new_cap
                         cap = new_cap
                         capture = self._capture_worker
                         read_failures = 0
                         continue
-                if read_failures >= 30:
+                if read_failures >= 60:
+                    message = (
+                        CAMERA_ERROR
+                        if self._source_kind == "webcam"
+                        else f"Lost input source: {self._source_label}"
+                    )
                     with self._lock:
                         self._running = False
-                        self._stats = VisionStats(state="error", error=CAMERA_ERROR)
+                        self._stats = VisionStats(state="error", error=message)
                     break
-                time.sleep(0.03)
+                time.sleep(0.02)
                 continue
 
             try:
@@ -1098,7 +1262,40 @@ class VisionEngine:
                     else:
                         box_labels = build_detection_labels(detections, class_names)
 
+                    if (
+                        config.show_identity
+                        and self._identity.enabled
+                        and not detections.is_empty()
+                    ):
+                        person_hints = collect_person_hints(
+                            track_items,
+                            detections,
+                            width,
+                            height,
+                            self._settings.identity_max_persons,
+                        )
+                        if person_hints and self._identity.wants_new_analysis(
+                            person_hints
+                        ):
+                            identity_jpeg = analysis_jpeg or encode_frame_jpeg(
+                                frame,
+                                max_width=analysis_width_for_frame(
+                                    width, self._settings
+                                ),
+                                quality=self._settings.gemini_jpeg_quality,
+                            )
+                            if identity_jpeg:
+                                self._identity.push_frame(identity_jpeg, person_hints)
+                        box_labels = apply_identity_labels(
+                            display_detections, box_labels, self._identity.cache
+                        )
+
                 if config.show_objects and not display_detections.is_empty():
+                    if config.show_masks and display_detections.mask is not None:
+                        annotated = self._mask_annotator.annotate(
+                            scene=annotated,
+                            detections=display_detections,
+                        )
                     annotated = self._box_annotator.annotate(
                         scene=annotated,
                         detections=display_detections,
@@ -1114,6 +1311,10 @@ class VisionEngine:
                     )
                 if config.show_pose:
                     annotated = self._pose_edge.annotate(scene=annotated, key_points=pose_kp)
+                    if config.show_pose_labels and not pose_kp.is_empty():
+                        annotated = draw_pose_labels(
+                            annotated, pose_kp, color=(197, 204, 212)
+                        )
                 if config.show_expressions and face_result and face_result.face_landmarks:
                     guidance = self._expression.get_guidance()
                     annotated = draw_expression_overlay(

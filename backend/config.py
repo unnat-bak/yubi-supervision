@@ -29,8 +29,14 @@ class Settings(BaseSettings):
     camera_width: int = 1280
     camera_height: int = 720
     camera_timeout_sec: int = 12
-    # Optional video file path; overrides camera_index (testing/CI without a webcam).
+    # Default input source. Overrides camera_index when set. May be a local video
+    # file path, an RTSP/HTTP(S) stream URL, a YouTube URL, or a webcam index ("0").
+    # The /api/start endpoint can override this per-session.
     camera_source: Optional[str] = None  # noqa: UP045
+    # Loop file/clip sources when they reach the end (continuous feed for analysis).
+    source_loop: bool = True
+    # Preferred yt-dlp format selector when resolving a YouTube/stream URL.
+    youtube_format: str = "best[ext=mp4][height<=1080]/best[height<=1080]/best"
 
     yolo_model: str = "yolov8s.pt"
     yolo_imgsz: int = 640
@@ -64,6 +70,18 @@ class Settings(BaseSettings):
     gemini_label_cache_sec: float = Field(default=45.0, ge=5.0, le=300.0)
     # YUBI v3.0 enrichment passes for post-session markdown (1–3).
     session_report_passes: int = Field(default=3, ge=1, le=3)
+
+    # Identity layer (YUBI v3.0 vision): name/jersey/descriptor per tracked person.
+    identity_enabled: bool = True
+    identity_interval_sec: float = Field(default=4.0, ge=2.0, le=30.0)
+    identity_max_persons: int = Field(default=6, ge=1, le=20)
+    # Confirmed identities stick on a tracker_id this long without re-querying.
+    identity_label_cache_sec: float = Field(default=90.0, ge=10.0, le=600.0)
+
+    # Default overlay layers (UI can toggle live; these set the initial state).
+    show_masks_default: bool = False
+    show_pose_labels_default: bool = False
+    show_identity_default: bool = False
 
     # Downscale camera frames before inference (major FPS win on 1080p webcams).
     processing_max_width: int = Field(default=1280, ge=640, le=1920)

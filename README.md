@@ -61,7 +61,21 @@ curl -X POST http://127.0.0.1:8000/api/stop
 
 `/api/status` includes `fps`, `latency_ms`, `degraded` subsystems, `session_id`, `gemini` (v3.0), and `expressions` blocks.
 
-**No webcam:** set `CAMERA_SOURCE=path/to/video.mp4` (loops as feed).
+**Input source (not just the webcam):** type a source into the **Input source** box
+on the idle screen — or set `CAMERA_SOURCE` — to analyze something other than the
+local camera. Supported:
+
+| Source | Example |
+|--------|---------|
+| Webcam | *(blank)* or `0` |
+| Local video file | `clips/traffic.mp4` (loops) |
+| CCTV / IP camera | `rtsp://user:pass@10.0.0.5:554/stream1` |
+| YouTube | `https://youtu.be/XXXXXXXXXXX` (resolved via `yt-dlp`) |
+
+**Segmentation masks:** set `YOLO_MODEL=yolov8s-seg.pt` and toggle the **Masks**
+layer for per-instance colored masks. **Joint tags** labels pose keypoints;
+**Identity** (needs `GEMINI_API_KEY`) tags tracked people with a name / jersey
+number / descriptor.
 
 ## UI layout
 
