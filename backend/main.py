@@ -64,7 +64,7 @@ async def update_config(payload: ConfigUpdate) -> dict:
 
 @app.post("/api/start", response_model=StartResponse)
 async def start_vision(
-    payload: StartRequest = Body(default=StartRequest()),
+    payload: StartRequest = Body(default_factory=StartRequest),
 ) -> StartResponse:
     if engine.is_running:
         return StartResponse(state="live", source_label=engine.source_label)
