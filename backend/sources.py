@@ -2,15 +2,21 @@
 
 Turns a user-supplied source string (webcam index, local file, RTSP/HTTP
 stream, or YouTube URL) into something OpenCV's ``VideoCapture`` can open.
-Kept free of heavy/vision imports so the classification logic is unit-testable.
+YouTube URLs are downloaded to a temp clip first — direct googlevideo URLs
+are not reliably readable by OpenCV on most builds.
 """
 
 from __future__ import annotations
 
+import tempfile
+import time
 from dataclasses import dataclass
+from pathlib import Path
 
 YOUTUBE_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
 _STREAM_SCHEMES = ("rtsp://", "rtmp://", "http://", "https://", "udp://", "tcp://")
+# Android/web clients avoid YouTube SABR/403 issues when fetching media bytes.
+YOUTUBE_EXTRACTOR_ARGS = {"youtube": {"player_client": ["android", "web"]}}
 
 
 @dataclass
@@ -19,6 +25,7 @@ class ResolvedSource:
     target: object  # int (webcam index) or str (path / URL) for VideoCapture
     label: str  # short human-readable description for the HUD
     is_live: bool  # live feed (always-latest) vs. seekable clip (every frame)
+    cleanup_path: str | None = None  # temp file to delete when the session ends
 
 
 def _looks_like_youtube(value: str) -> bool:
@@ -48,11 +55,46 @@ def _shorten(value: str, limit: int = 48) -> str:
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
 
-def resolve_youtube_url(url: str, fmt: str, timeout_sec: float = 20.0) -> tuple[str, str]:
-    """Resolve a YouTube watch URL to a direct media URL via yt-dlp.
+def get_youtube_cache_dir(custom_dir: str | None = None) -> Path:
+    """Return the folder where YouTube clips are stored between sessions."""
+    if custom_dir:
+        path = Path(custom_dir).expanduser().resolve()
+    else:
+        path = Path(tempfile.gettempdir()) / "yubi-supervision" / "youtube"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
-    Returns ``(direct_url, title)``. Raises RuntimeError with an actionable
-    message when yt-dlp is missing or resolution fails.
+
+def prune_youtube_cache(cache_dir: Path, max_age_hours: float) -> int:
+    """Remove cached clips older than ``max_age_hours``. Returns files deleted."""
+    if max_age_hours <= 0 or not cache_dir.is_dir():
+        return 0
+    cutoff = time.time() - max_age_hours * 3600.0
+    removed = 0
+    for path in cache_dir.iterdir():
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def download_youtube_clip(
+    url: str,
+    fmt: str,
+    timeout_sec: float = 120.0,
+    *,
+    cache_dir: Path | None = None,
+    cache_max_age_hours: float = 168.0,
+) -> tuple[str, str]:
+    """Download a YouTube watch URL to a local clip OpenCV can read.
+
+    Returns ``(local_path, title)``. Raises RuntimeError with an actionable
+    message when yt-dlp is missing or the download fails.
     """
     try:
         from yt_dlp import YoutubeDL
@@ -61,36 +103,40 @@ def resolve_youtube_url(url: str, fmt: str, timeout_sec: float = 20.0) -> tuple[
             "YouTube input needs yt-dlp. Install it: pip install yt-dlp"
         ) from exc
 
+    out_dir = cache_dir or get_youtube_cache_dir()
+    prune_youtube_cache(out_dir, cache_max_age_hours)
     options = {
         "quiet": True,
         "no_warnings": True,
-        "skip_download": True,
         "format": fmt,
-        "socket_timeout": timeout_sec,
+        "outtmpl": str(out_dir / "%(id)s.%(ext)s"),
         "noplaylist": True,
+        "socket_timeout": timeout_sec,
+        "overwrites": True,
+        "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
     }
     try:
         with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
+            info = ydl.extract_info(url, download=True)
+            if info is None:
+                raise RuntimeError("Could not download YouTube video (no media found).")
+            path = ydl.prepare_filename(info)
+            title = str(info.get("title") or "YouTube")
+    except RuntimeError:
+        raise
     except Exception as exc:  # pragma: no cover - network dependent
-        raise RuntimeError(f"Could not resolve YouTube source: {exc}") from exc
+        raise RuntimeError(f"Could not download YouTube video: {exc}") from exc
 
-    if info is None:
-        raise RuntimeError("Could not resolve YouTube source (no media found).")
-
-    direct = info.get("url")
-    if not direct:
-        # Some extractions only expose per-format URLs.
-        formats = info.get("formats") or []
-        for candidate in reversed(formats):
-            if candidate.get("url"):
-                direct = candidate["url"]
-                break
-    if not direct:
-        raise RuntimeError("YouTube source did not yield a playable stream URL.")
-
-    title = str(info.get("title") or "YouTube") if isinstance(info, dict) else "YouTube"
-    return str(direct), title
+    clip = Path(path)
+    if not clip.is_file():
+        video_id = str(info.get("id") or "clip")
+        ext = str(info.get("ext") or "mp4")
+        clip = out_dir / f"{video_id}.{ext}"
+    if not clip.is_file():
+        raise RuntimeError(
+            "YouTube download finished but the clip file is missing on disk."
+        )
+    return str(clip), title
 
 
 def resolve_source(
@@ -98,6 +144,8 @@ def resolve_source(
     *,
     camera_index: int,
     youtube_format: str,
+    youtube_cache_dir: str | None = None,
+    youtube_cache_max_age_hours: float = 168.0,
 ) -> ResolvedSource:
     """Resolve a source string into a ``ResolvedSource`` ready for VideoCapture.
 
@@ -117,12 +165,19 @@ def resolve_source(
         )
 
     if kind == "youtube":
-        direct, title = resolve_youtube_url(value, youtube_format)
+        cache_dir = get_youtube_cache_dir(youtube_cache_dir)
+        clip_path, title = download_youtube_clip(
+            value,
+            youtube_format,
+            cache_dir=cache_dir,
+            cache_max_age_hours=youtube_cache_max_age_hours,
+        )
         return ResolvedSource(
             kind="youtube",
-            target=direct,
+            target=clip_path,
             label=_shorten(title),
             is_live=False,
+            cleanup_path=clip_path,
         )
 
     if kind == "stream":

@@ -42,7 +42,7 @@ from backend.identity_vision import (
     apply_identity_labels,
     collect_person_hints,
 )
-from backend.sources import ResolvedSource, resolve_source
+from backend.sources import ResolvedSource, classify_source, resolve_source
 
 MODEL_URLS = {
     "pose_landmarker_lite.task": (
@@ -488,6 +488,7 @@ class VisionEngine:
         self._source_request: str | None = None
         self._source_label = ""
         self._source_kind = ""
+        self._source_cleanup_path: str | None = None
         self._cap: cv2.VideoCapture | None = None
         self._capture_worker: _CaptureWorker | None = None
         self._pose: mp.tasks.vision.PoseLandmarker | None = None
@@ -758,19 +759,32 @@ class VisionEngine:
             if self._source_request is not None
             else self._settings.camera_source
         )
+        if classify_source(raw) == "youtube":
+            self._set_startup_message("Downloading YouTube clip…")
         resolved = resolve_source(
             raw,
             camera_index=self._settings.camera_index,
             youtube_format=self._settings.youtube_format,
+            youtube_cache_dir=self._settings.youtube_cache_dir,
+            youtube_cache_max_age_hours=float(
+                self._settings.youtube_cache_max_age_hours
+            ),
         )
 
         if resolved.kind == "webcam":
             cap = self._open_webcam(int(resolved.target))
         else:
-            cap = cv2.VideoCapture(resolved.target)
+            cap = cv2.VideoCapture(str(resolved.target), cv2.CAP_FFMPEG)
             if not cap.isOpened():
                 cap.release()
                 raise RuntimeError(f"Could not open source: {resolved.label}")
+            ok, _ = cap.read()
+            if not ok:
+                cap.release()
+                raise RuntimeError(
+                    f"Could not read frames from source: {resolved.label}"
+                )
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self._tune_capture(cap)
         return resolved, cap
 
@@ -892,6 +906,7 @@ class VisionEngine:
             with self._lock:
                 self._source_label = resolved.label
                 self._source_kind = resolved.kind
+                self._source_cleanup_path = resolved.cleanup_path
 
             if not self._still_starting():
                 cap.release()
@@ -1027,7 +1042,10 @@ class VisionEngine:
             self._thread.join(timeout=2.0)
         self._thread = None
 
+        cleanup_path = None
         with self._lock:
+            cleanup_path = self._source_cleanup_path
+            self._source_cleanup_path = None
             self._release_models(self._cap, self._pose, self._face, self._hand)
             self._cap = None
             self._pose = None
@@ -1040,6 +1058,12 @@ class VisionEngine:
             self._source_label = ""
             self._source_kind = ""
             self._stats = VisionStats(state="idle")
+
+        if cleanup_path:
+            try:
+                Path(cleanup_path).unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _detect_objects(
         self, frame: np.ndarray, yolo: YOLO, confidence: float

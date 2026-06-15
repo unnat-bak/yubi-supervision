@@ -524,6 +524,14 @@ body {
   border: 1px solid rgba(var(--signal-rgb), 0.07);
   border-radius: 2px;
   background: rgba(0, 0, 0, 0.25);
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.pipe-item:hover {
+  border-color: rgba(var(--signal-rgb), 0.22);
+  color: rgba(232, 234, 237, 0.55);
 }
 
 .pipe-dot {
@@ -1356,6 +1364,29 @@ body {
 
 .btn:not(:disabled):hover {
   transform: translateY(-1px);
+}
+
+.btn-chrome.active {
+  background: rgba(61, 214, 198, 0.12);
+  color: var(--signal);
+  box-shadow: inset 0 0 0 1px var(--border-strong);
+}
+
+#video-wrap.cinema-mode .detections-panel,
+#video-wrap.cinema-mode .right-rail,
+#video-wrap.cinema-mode .stats-rail,
+#video-wrap.cinema-mode .hud-overlay {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.source-cache-hint {
+  margin-top: 6px;
+  font-size: 0.62rem;
+  line-height: 1.35;
+  color: rgba(255, 255, 255, 0.34);
+  word-break: break-all;
 }
 
 .btn-primary {

@@ -27,6 +27,7 @@ EXPR_MESH_CONNECTIONS: tuple[tuple[int, int], ...] = tuple(
         FLC.FACE_LANDMARKS_LEFT_IRIS,
         FLC.FACE_LANDMARKS_RIGHT_IRIS,
         FLC.FACE_LANDMARKS_NOSE,
+        FLC.FACE_LANDMARKS_LIPS,
     )
     for conn in group
 )
@@ -44,6 +45,15 @@ MICRO_BLENDSHAPE_NAMES: frozenset[str] = frozenset(
         "cheekSquintRight",
         "eyeWideLeft",
         "eyeWideRight",
+        "jawOpen",
+        "mouthSmileLeft",
+        "mouthSmileRight",
+        "mouthFrownLeft",
+        "mouthFrownRight",
+        "mouthPucker",
+        "mouthFunnel",
+        "noseSneerLeft",
+        "noseSneerRight",
     }
 )
 
@@ -59,6 +69,15 @@ MICRO_LABELS: dict[str, str] = {
     "cheekSquintRight": "Cheek twitch (right)",
     "eyeWideLeft": "Eye widen (left)",
     "eyeWideRight": "Eye widen (right)",
+    "jawOpen": "Jaw open",
+    "mouthSmileLeft": "Smile (left)",
+    "mouthSmileRight": "Smile (right)",
+    "mouthFrownLeft": "Mouth frown (left)",
+    "mouthFrownRight": "Mouth frown (right)",
+    "mouthPucker": "Lip pucker",
+    "mouthFunnel": "Lip funnel",
+    "noseSneerLeft": "Nose sneer (left)",
+    "noseSneerRight": "Nose sneer (right)",
 }
 
 
@@ -78,6 +97,8 @@ class ExpressionGuidance:
     right_eyebrow_box: list[int] | None = None
     left_under_eye_box: list[int] | None = None
     right_under_eye_box: list[int] | None = None
+    nose_box: list[int] | None = None
+    mouth_box: list[int] | None = None
     micro_cues: list[str] = field(default_factory=list)
     structure_notes: str = ""
     error: str | None = None
@@ -148,7 +169,14 @@ class MicroExpressionTracker:
             magnitude = max(abs(delta), abs(spike))
             if magnitude < self._micro_threshold and abs(spike) < self._spike_threshold:
                 continue
-            region = "eyebrow" if "brow" in key else "under-eye"
+            if "brow" in key:
+                region = "eyebrow"
+            elif "mouth" in key or key == "jawOpen":
+                region = "mouth"
+            elif "nose" in key:
+                region = "nose"
+            else:
+                region = "under-eye"
             events.append(
                 MicroEvent(
                     label=MICRO_LABELS.get(key, key),
@@ -171,29 +199,60 @@ def landmarks_to_points(
     )
 
 
+def _connection_indices(group: Any) -> set[int]:
+    return {conn.start for conn in group} | {conn.end for conn in group}
+
+
+EXPR_OVAL_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_FACE_OVAL)
+)
+
+
 def refine_landmarks_with_guidance(
     points: np.ndarray,
     guidance: ExpressionGuidance,
     width: int,
     height: int,
-    max_shift_px: float = 14.0,
+    snap_strength: float = 0.78,
+    max_scale_delta: float = 0.14,
 ) -> np.ndarray:
+    """Snap MediaPipe landmarks to the v3.0 face box via scale + translation."""
     if guidance.face_box_2d is None or len(points) == 0:
         return points
-    ymin, xmin, ymax, xmax = guidance.face_box_2d
-    ai_cx = (xmin + xmax) * width / 2000.0
-    ai_cy = (ymin + ymax) * height / 2000.0
-    mp_cx = float(points[:, 0].mean())
-    mp_cy = float(points[:, 1].mean())
-    dx = ai_cx - mp_cx
-    dy = ai_cy - mp_cy
-    dist = (dx * dx + dy * dy) ** 0.5
-    if dist < 3.0:
+
+    oval_idx = [idx for idx in EXPR_OVAL_INDICES if idx < len(points)]
+    if len(oval_idx) < 4:
         return points
-    if dist > max_shift_px:
-        dx *= max_shift_px / dist
-        dy *= max_shift_px / dist
-    return points + np.array([dx, dy], dtype=np.float32)
+    oval_pts = points[oval_idx]
+
+    mp_x1, mp_y1 = float(oval_pts[:, 0].min()), float(oval_pts[:, 1].min())
+    mp_x2, mp_y2 = float(oval_pts[:, 0].max()), float(oval_pts[:, 1].max())
+    mp_cx = (mp_x1 + mp_x2) * 0.5
+    mp_cy = (mp_y1 + mp_y2) * 0.5
+    mp_w = max(mp_x2 - mp_x1, 1.0)
+    mp_h = max(mp_y2 - mp_y1, 1.0)
+
+    ymin, xmin, ymax, xmax = guidance.face_box_2d
+    ai_x1 = xmin * width / 1000.0
+    ai_y1 = ymin * height / 1000.0
+    ai_x2 = xmax * width / 1000.0
+    ai_y2 = ymax * height / 1000.0
+    ai_cx = (ai_x1 + ai_x2) * 0.5
+    ai_cy = (ai_y1 + ai_y2) * 0.5
+    ai_w = max(ai_x2 - ai_x1, 1.0)
+    ai_h = max(ai_y2 - ai_y1, 1.0)
+
+    scale = min(ai_w / mp_w, ai_h / mp_h)
+    lo = 1.0 - max_scale_delta
+    hi = 1.0 + max_scale_delta
+    scale = max(lo, min(hi, scale))
+
+    centered = points - np.array([mp_cx, mp_cy], dtype=np.float32)
+    aligned = centered * scale + np.array([ai_cx, ai_cy], dtype=np.float32)
+
+    misalign = ((ai_cx - mp_cx) ** 2 + (ai_cy - mp_cy) ** 2) ** 0.5
+    strength = snap_strength if misalign >= 4.0 else snap_strength * 0.35
+    return points * (1.0 - strength) + aligned * strength
 
 
 def crop_face_jpeg(
@@ -240,10 +299,6 @@ def _box_to_xyxy(box: list[int], width: int, height: int) -> tuple[int, int, int
     )
 
 
-def _connection_indices(group: Any) -> set[int]:
-    return {conn.start for conn in group} | {conn.end for conn in group}
-
-
 EXPR_BROW_INDICES: frozenset[int] = frozenset(
     _connection_indices(FLC.FACE_LANDMARKS_LEFT_EYEBROW)
     | _connection_indices(FLC.FACE_LANDMARKS_RIGHT_EYEBROW)
@@ -255,6 +310,12 @@ EXPR_EYE_INDICES: frozenset[int] = frozenset(
 EXPR_IRIS_INDICES: frozenset[int] = frozenset(
     _connection_indices(FLC.FACE_LANDMARKS_LEFT_IRIS)
     | _connection_indices(FLC.FACE_LANDMARKS_RIGHT_IRIS)
+)
+EXPR_NOSE_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_NOSE)
+)
+EXPR_LIPS_INDICES: frozenset[int] = frozenset(
+    _connection_indices(FLC.FACE_LANDMARKS_LIPS)
 )
 
 # BGR — aligned with overlay pearl / signal palette in vision.py
@@ -290,6 +351,8 @@ def draw_expression_overlay(
     highlight_regions: set[str] = {e.region for e in micro_events}
     brow_active = "eyebrow" in highlight_regions
     eye_active = "under-eye" in highlight_regions
+    nose_active = "nose" in highlight_regions
+    mouth_active = "mouth" in highlight_regions
 
     for landmarks in face_landmarks:
         points = landmarks_to_points(landmarks, width, height)
@@ -313,6 +376,8 @@ def draw_expression_overlay(
             guidance.right_eyebrow_box,
             guidance.left_under_eye_box,
             guidance.right_under_eye_box,
+            guidance.nose_box,
+            guidance.mouth_box,
         ):
             if not box:
                 continue
@@ -339,6 +404,20 @@ def draw_expression_overlay(
             EXPR_IRIS_INDICES,
             1,
             _TRACK_DOT_ACTIVE if eye_active else _TRACK_DOT_BASE,
+        )
+        _draw_track_dots(
+            scene,
+            pts_i,
+            EXPR_NOSE_INDICES,
+            2 if nose_active else 1,
+            _TRACK_DOT_ACTIVE if nose_active else _TRACK_DOT_BASE,
+        )
+        _draw_track_dots(
+            scene,
+            pts_i,
+            EXPR_LIPS_INDICES,
+            2 if mouth_active else 1,
+            _TRACK_DOT_ACTIVE if mouth_active else _TRACK_DOT_BASE,
         )
 
     return scene
@@ -413,6 +492,8 @@ class ExpressionEnricher:
                 right_eyebrow_box=self._guidance.right_eyebrow_box,
                 left_under_eye_box=self._guidance.left_under_eye_box,
                 right_under_eye_box=self._guidance.right_under_eye_box,
+                nose_box=self._guidance.nose_box,
+                mouth_box=self._guidance.mouth_box,
                 micro_cues=list(self._guidance.micro_cues),
                 structure_notes=self._guidance.structure_notes,
                 error=self._guidance.error,
@@ -443,6 +524,8 @@ class ExpressionEnricher:
                     right_eyebrow_box=self._guidance.right_eyebrow_box,
                     left_under_eye_box=self._guidance.left_under_eye_box,
                     right_under_eye_box=self._guidance.right_under_eye_box,
+                    nose_box=self._guidance.nose_box,
+                    mouth_box=self._guidance.mouth_box,
                     micro_cues=list(self._guidance.micro_cues),
                     structure_notes=self._guidance.structure_notes,
                 )
@@ -461,12 +544,14 @@ class ExpressionEnricher:
             '- "right_eyebrow_box": tight box for right eyebrow region\n'
             '- "left_under_eye_box": tight box under left eye (orbital muscle area)\n'
             '- "right_under_eye_box": tight box under right eye\n'
+            '- "nose_box": tight box covering nose bridge and tip\n'
+            '- "mouth_box": tight box covering lips and mouth opening\n'
             '- "micro_cues": array of short strings for subtle cues seen NOW '
-            '(e.g. "slight brow arch", "under-eye twitch left")\n'
+            '(e.g. "slight brow arch", "lip press", "nostril flare left")\n'
             '- "structure_notes": one sentence on face structure/orientation '
             "to help landmark alignment\n"
             "Boxes use [ymin, xmin, ymax, xmax] normalized 0-1000. "
-            "Focus on eyebrows and under-eye micro-movements."
+            "Cover the full face: brows, under-eye, nose, and mouth."
         )
 
         response = client.models.generate_content(
@@ -499,6 +584,8 @@ class ExpressionEnricher:
             right_eyebrow_box=parse_box("right_eyebrow_box"),
             left_under_eye_box=parse_box("left_under_eye_box"),
             right_under_eye_box=parse_box("right_under_eye_box"),
+            nose_box=parse_box("nose_box"),
+            mouth_box=parse_box("mouth_box"),
             micro_cues=[str(c) for c in cues[:8]],
             structure_notes=str(payload.get("structure_notes", "")).strip(),
             updated_at=time.time(),

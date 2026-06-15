@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from backend.sources import classify_source, resolve_source
 
 
@@ -49,3 +51,42 @@ def test_resolve_stream_is_live() -> None:
     )
     assert resolved.kind == "stream"
     assert resolved.is_live is True
+
+
+def test_resolve_youtube_downloads_local_clip() -> None:
+    with patch(
+        "backend.sources.download_youtube_clip",
+        return_value=("/tmp/yubi-test.mp4", "CCTV clip"),
+    ) as download:
+        resolved = resolve_source(
+            "https://youtu.be/abc123XYZ01",
+            camera_index=0,
+            youtube_format="best[ext=mp4]/best",
+        )
+    download.assert_called_once()
+    assert download.call_args.args[0] == "https://youtu.be/abc123XYZ01"
+    assert download.call_args.args[1] == "best[ext=mp4]/best"
+    assert resolved.kind == "youtube"
+    assert resolved.target == "/tmp/yubi-test.mp4"
+    assert resolved.cleanup_path == "/tmp/yubi-test.mp4"
+    assert resolved.is_live is False
+    assert resolved.label == "CCTV clip"
+
+
+def test_prune_youtube_cache_removes_old_files(tmp_path) -> None:
+    import os
+    import time
+
+    from backend.sources import prune_youtube_cache
+
+    old = tmp_path / "old.mp4"
+    new = tmp_path / "new.mp4"
+    old.write_bytes(b"x")
+    new.write_bytes(b"x")
+    old_time = time.time() - 3600 * 200
+    os.utime(old, (old_time, old_time))
+
+    removed = prune_youtube_cache(tmp_path, max_age_hours=168)
+    assert removed == 1
+    assert not old.exists()
+    assert new.exists()

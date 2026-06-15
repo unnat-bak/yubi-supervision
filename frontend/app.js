@@ -48,8 +48,12 @@ const expressionLiveLabel = document.getElementById("expression-live-label");
 const expressionSignalCount = document.getElementById("expression-signal-count");
 const exprBarBrow = document.getElementById("expr-bar-brow");
 const exprBarEye = document.getElementById("expr-bar-eye");
+const exprBarNose = document.getElementById("expr-bar-nose");
+const exprBarMouth = document.getElementById("expr-bar-mouth");
 const exprRegionBrowVal = document.getElementById("expr-region-brow-val");
 const exprRegionEyeVal = document.getElementById("expr-region-eye-val");
+const exprRegionNoseVal = document.getElementById("expr-region-nose-val");
+const exprRegionMouthVal = document.getElementById("expr-region-mouth-val");
 const exprRegionEls = document.querySelectorAll(".expr-region");
 const hudOverlay = document.getElementById("hud-overlay");
 const pipelineRail = document.getElementById("pipeline-rail");
@@ -95,6 +99,32 @@ let lastGeminiState = null;
 let lastObjectCount = null;
 const fpsHistory = [];
 const MAX_FPS_HISTORY = 48;
+
+const videoWrap = document.getElementById("video-wrap");
+const btnFocus = document.getElementById("btn-focus");
+const btnClean = document.getElementById("btn-clean");
+const sourceCacheHint = document.getElementById("source-cache-hint");
+
+const PIPE_LAYER_MAP = {
+  objects: "show_objects",
+  pose: "show_pose",
+  face: "show_face",
+  hands: "show_hands",
+  expressions: "show_expressions",
+  masks: "show_masks",
+  jtags: "show_pose_labels",
+  identity: "show_identity",
+  v3: "show_gemini",
+};
+
+const OVERLAY_LAYER_KEYS = Object.values(PIPE_LAYER_MAP);
+
+let lastLiveConfig = null;
+let focusMode = false;
+let cleanFeedMode = false;
+let savedOverlayConfig = null;
+let youtubeCacheDir = "";
+let youtubeCacheAnnounced = false;
 
 const LOG_TAG_LABELS = {
   sys: "System",
@@ -512,6 +542,7 @@ function updatePipelineRail(config, gemini, expressions) {
     hands: config.show_hands,
     expressions: config.show_expressions && Boolean(expressions?.enabled),
     masks: config.show_masks,
+    jtags: config.show_pose_labels,
     identity: config.show_identity && gemini?.enabled,
     v3: config.show_gemini && gemini?.enabled,
   };
@@ -638,6 +669,117 @@ function setLiveControls(enabled) {
   btnStop.disabled = !enabled;
   btnSnapshot.disabled = !enabled || snapshotBusy;
   btnRecord.disabled = !enabled;
+  if (btnFocus) btnFocus.disabled = !enabled;
+  if (btnClean) btnClean.disabled = !enabled;
+}
+
+function applyFocusMode() {
+  if (videoWrap) {
+    videoWrap.classList.toggle("cinema-mode", focusMode);
+  }
+  if (btnFocus) {
+    btnFocus.classList.toggle("active", focusMode);
+    btnFocus.textContent = focusMode ? "Panels" : "Focus";
+  }
+}
+
+function toggleFocusMode() {
+  if (!isLive) return;
+  focusMode = !focusMode;
+  applyFocusMode();
+  showToast(focusMode ? "Side panels hidden — use top rail to toggle layers" : "Side panels restored");
+}
+
+function overlayConfigFrom(config) {
+  const partial = {};
+  for (const key of OVERLAY_LAYER_KEYS) {
+    partial[key] = Boolean(config?.[key]);
+  }
+  return partial;
+}
+
+function allOverlaysOffPartial() {
+  const partial = {};
+  for (const key of OVERLAY_LAYER_KEYS) {
+    partial[key] = false;
+  }
+  return partial;
+}
+
+async function toggleLayer(layerKey, next) {
+  const partial = { [layerKey]: next };
+  const chip = layerToggles?.querySelector(`[data-layer="${layerKey}"]`);
+  const wasActive = chip?.classList.contains("active");
+  if (chip) chip.classList.toggle("active", next);
+  const config = await pushConfig(partial);
+  if (!config) {
+    if (chip && wasActive != null) chip.classList.toggle("active", wasActive);
+    return null;
+  }
+  lastLiveConfig = config;
+  syncLayerChips(config);
+  if (cleanFeedMode && Object.values(overlayConfigFrom(config)).some(Boolean)) {
+    cleanFeedMode = false;
+    savedOverlayConfig = null;
+    if (btnClean) btnClean.textContent = "Clean feed";
+  }
+  return config;
+}
+
+async function toggleCleanFeed() {
+  if (!isLive) return;
+  if (cleanFeedMode && savedOverlayConfig) {
+    const config = await pushConfig(savedOverlayConfig);
+    if (!config) return;
+    lastLiveConfig = config;
+    syncLayerChips(config);
+    cleanFeedMode = false;
+    savedOverlayConfig = null;
+    if (btnClean) {
+      btnClean.classList.remove("active");
+      btnClean.textContent = "Clean feed";
+    }
+    showToast("Vision overlays restored");
+    return;
+  }
+  if (!lastLiveConfig) return;
+  savedOverlayConfig = overlayConfigFrom(lastLiveConfig);
+  const config = await pushConfig(allOverlaysOffPartial());
+  if (!config) {
+    savedOverlayConfig = null;
+    return;
+  }
+  lastLiveConfig = config;
+  syncLayerChips(config);
+  cleanFeedMode = true;
+  if (btnClean) {
+    btnClean.classList.add("active");
+    btnClean.textContent = "Overlays";
+  }
+  showToast("All vision overlays hidden");
+}
+
+function resetViewModes() {
+  focusMode = false;
+  cleanFeedMode = false;
+  savedOverlayConfig = null;
+  applyFocusMode();
+  if (btnClean) {
+    btnClean.classList.remove("active");
+    btnClean.textContent = "Clean feed";
+  }
+}
+
+function updateSourceCacheHint() {
+  if (!sourceCacheHint || !youtubeCacheDir) return;
+  sourceCacheHint.textContent = `YouTube clips cache: ${youtubeCacheDir} (removed on Terminate; stale files pruned after 7 days)`;
+  sourceCacheHint.hidden = false;
+}
+
+function maybeAnnounceYoutubeCache(sourceKind) {
+  if (sourceKind !== "youtube" || !youtubeCacheDir || youtubeCacheAnnounced) return;
+  youtubeCacheAnnounced = true;
+  showToast(`YouTube cache: ${youtubeCacheDir}`, 4500);
 }
 
 function applyLiveUI() {
@@ -666,6 +808,8 @@ function applyLiveUI() {
   if (becomingLive) {
     pushFeed("sys", "Vision pipeline online", new Date().toTimeString().slice(0, 8));
   }
+  if (btnFocus) btnFocus.disabled = false;
+  if (btnClean) btnClean.disabled = false;
 }
 
 function setError(message) {
@@ -874,6 +1018,8 @@ function clearPanelContent() {
   }
   setExpressionRegionActivity("eyebrow", 0);
   setExpressionRegionActivity("under-eye", 0);
+  setExpressionRegionActivity("nose", 0);
+  setExpressionRegionActivity("mouth", 0);
 }
 
 function renderAnalysis(analysis) {
@@ -952,12 +1098,20 @@ function setExpressionRegionActivity(region, intensity) {
   } else if (region === "under-eye" && exprBarEye && exprRegionEyeVal) {
     exprBarEye.style.width = `${pct}%`;
     exprRegionEyeVal.textContent = label;
+  } else if (region === "nose" && exprBarNose && exprRegionNoseVal) {
+    exprBarNose.style.width = `${pct}%`;
+    exprRegionNoseVal.textContent = label;
+  } else if (region === "mouth" && exprBarMouth && exprRegionMouthVal) {
+    exprBarMouth.style.width = `${pct}%`;
+    exprRegionMouthVal.textContent = label;
   }
   for (const el of exprRegionEls) {
     const regionLabel = el.querySelector(".expr-region-label")?.textContent;
     const match =
       (region === "eyebrow" && regionLabel === "Brow") ||
-      (region === "under-eye" && regionLabel === "Under-eye");
+      (region === "under-eye" && regionLabel === "Under-eye") ||
+      (region === "nose" && regionLabel === "Nose") ||
+      (region === "mouth" && regionLabel === "Mouth");
     if (match) {
       el.classList.toggle("active", pct > 12);
     }
@@ -1001,9 +1155,17 @@ function renderExpressions(expr) {
   const eyeIntensity = events
     .filter((e) => e.region === "under-eye")
     .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
+  const noseIntensity = events
+    .filter((e) => e.region === "nose")
+    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
+  const mouthIntensity = events
+    .filter((e) => e.region === "mouth")
+    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
 
   setExpressionRegionActivity("eyebrow", browIntensity);
   setExpressionRegionActivity("under-eye", eyeIntensity);
+  setExpressionRegionActivity("nose", noseIntensity);
+  setExpressionRegionActivity("mouth", mouthIntensity);
 
   if (expressionPulse) {
     expressionPulse.className = "expression-pulse";
@@ -1027,7 +1189,7 @@ function renderExpressions(expr) {
 
   expressionNotes.textContent =
     expr.structure_notes ||
-    (cues.length ? cues.join(" · ") : "Monitoring brow and under-eye micro-movements.");
+    (cues.length ? cues.join(" · ") : "Monitoring brow, under-eye, nose, and mouth micro-movements.");
 
   expressionList.replaceChildren();
   const items = events.length
@@ -1069,6 +1231,9 @@ function renderExpressions(expr) {
 function setIdle() {
   isLive = false;
   snapshotBusy = false;
+  resetViewModes();
+  youtubeCacheAnnounced = false;
+  lastLiveConfig = null;
   stream.removeAttribute("src");
   stream.classList.remove("live");
   btnStart.disabled = false;
@@ -1137,6 +1302,7 @@ async function pushConfig(partial) {
       });
     }
     if (isLive) {
+      lastLiveConfig = config;
       refreshStatus();
     }
     return config;
@@ -1184,6 +1350,8 @@ async function refreshStatus() {
       }
       renderDetections(data.tracks, data.objects);
       syncLayerChips(data.config);
+      lastLiveConfig = data.config;
+      maybeAnnounceYoutubeCache(data.source_kind);
       if (activeSession && data.gemini?.scene_summary) {
         const summary = data.gemini.scene_summary;
         if (summary !== activeSession.lastV3Summary) {
@@ -1382,15 +1550,26 @@ if (layerToggles) {
     const chip = e.target.closest(".layer-chip");
     if (!chip) return;
     const layer = chip.dataset.layer;
-    const wasActive = chip.classList.contains("active");
-    const next = !wasActive;
-    chip.classList.toggle("active", next);
-    pushConfig({ [layer]: next }).then((config) => {
-      if (!config) {
-        chip.classList.toggle("active", wasActive);
-      }
-    });
+    const next = !chip.classList.contains("active");
+    toggleLayer(layer, next);
   });
+}
+
+if (pipelineRail) {
+  pipelineRail.addEventListener("click", (e) => {
+    const item = e.target.closest(".pipe-item");
+    if (!item || !isLive) return;
+    const layerKey = PIPE_LAYER_MAP[item.dataset.pipe];
+    if (!layerKey || !lastLiveConfig) return;
+    toggleLayer(layerKey, !lastLiveConfig[layerKey]);
+  });
+}
+
+if (btnFocus) {
+  btnFocus.addEventListener("click", toggleFocusMode);
+}
+if (btnClean) {
+  btnClean.addEventListener("click", toggleCleanFeed);
 }
 
 function applyThreshold() {
@@ -1429,17 +1608,34 @@ document.addEventListener("keydown", (e) => {
   if ((e.key === "s" || e.key === "S") && !btnSnapshot.disabled) {
     e.preventDefault();
     takeSnapshot();
+    return;
+  }
+  if ((e.key === "f" || e.key === "F") && !btnFocus?.disabled) {
+    e.preventDefault();
+    toggleFocusMode();
+    return;
+  }
+  if ((e.key === "c" || e.key === "C") && !btnClean?.disabled) {
+    e.preventDefault();
+    toggleCleanFeed();
   }
 });
 
 async function hydrateFromServer() {
   try {
-    const [configRes, statusRes] = await Promise.all([
+    const [configRes, statusRes, healthRes] = await Promise.all([
       fetch("/api/config"),
       fetch("/api/status"),
+      fetch("/api/health"),
     ]);
     const config = await configRes.json();
     const status = await statusRes.json();
+    const health = await healthRes.json().catch(() => ({}));
+
+    if (health.youtube_cache_dir) {
+      youtubeCacheDir = health.youtube_cache_dir;
+      updateSourceCacheHint();
+    }
 
     syncLayerChips(config);
     if (config.confidence != null) {
