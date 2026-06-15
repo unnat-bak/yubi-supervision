@@ -8,11 +8,14 @@ Full-screen **command-center** live webcam vision: YOLOv8 + ByteTrack, MediaPipe
 
 | Capability | UI / behavior |
 |------------|----------------|
+| **Input source** | Idle-screen **Input source** box: webcam, local video file, RTSP/CCTV stream, or YouTube URL (resolved via yt-dlp); files loop, live feeds stay latest; SRC shown in command HUD |
 | **Objects** | Corner boxes, labels, tracker IDs; object registry + confidence gate in left sidebar |
-| **Pose / face / hands** | Toggleable skeleton overlays (muted sage-teal palette) |
+| **Segmentation masks** | Per-instance colored masks when a YOLO `*-seg` model is configured; **Masks** layer chip |
+| **Pose / face / hands** | Toggleable skeleton overlays (muted sage-teal palette); **Joint tags** chip labels curated pose keypoints |
+| **Identity** | Per-tracked-person name / jersey number / descriptor via YUBI v3.0, cached on `tracker_id`; **Identity** layer chip (needs API key) |
 | **Expressions** | Replaces face overlay: facial mesh + live tracking dots; expanded right **micro-expression dock** (region meters, live signals) |
 | **YUBI v3.0** | Semantic scene summary + object list in right panel; optional overlay boxes; label verify/correct for uncertain YOLO hits |
-| **Command HUD** | Top bar: UTC, session ID, frame index, uptime; pipeline rail (OBS/SKEL/FACE/HAND/EXPR/V3.0); FPS/latency sparkline |
+| **Command HUD** | Top bar: UTC, session ID, frame index, uptime, source; pipeline rail (OBS/SKEL/FACE/HAND/EXPR/MASK/ID/V3.0); FPS/latency sparkline |
 | **Intel feed** | Chronological event log in left sidebar (system, v3.0, objects, expressions, alerts) |
 | **Alerts** | Watchlist classes → banner + optional webhook |
 | **Capture / record** | PNG snapshot (+ JSON bundle), annotated MP4 to `recordings/` |
@@ -62,7 +65,9 @@ backend/
   config.py            # Settings from environment
   schemas.py           # Pydantic request/response models
   vision.py            # VisionEngine — capture, inference, annotation orchestration
+  sources.py           # Input source resolution (webcam / file / RTSP / YouTube via yt-dlp)
   gemini_vision.py     # YUBI v3.0 enricher, label reconciliation, track label cache
+  identity_vision.py   # Per-track identity (name/jersey/descriptor) enricher + cache
   expression_vision.py # Micro-expression tracker, mesh overlay, face-structure guidance
   session_report.py    # Multi-pass post-session markdown enrichment (YUBI v3.0)
   models/              # Auto-downloaded MediaPipe .task files (gitignored)
@@ -100,6 +105,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for API contracts, threading, r
 |--------|----------|
 | New API route | `backend/main.py` + schema in `backend/schemas.py` |
 | Env / defaults | `backend/config.py` + `.env.example` |
+| Input source (file / stream / YouTube) | `backend/sources.py` |
+| Identity / jersey labels | `backend/identity_vision.py` |
 | Object / pose / capture loop | `backend/vision.py` |
 | YUBI v3.0 scene / boxes / reconcile | `backend/gemini_vision.py` |
 | Expression overlay / micro-signals | `backend/expression_vision.py` |

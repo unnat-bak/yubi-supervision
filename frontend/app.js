@@ -18,6 +18,8 @@ const objectTotal = document.getElementById("object-total");
 const confidenceSlider = document.getElementById("confidence-slider");
 const confidenceValue = document.getElementById("confidence-value");
 const layerToggles = document.getElementById("layer-toggles");
+const sourceInput = document.getElementById("source-input");
+const telemetrySource = document.getElementById("telemetry-source");
 
 const statObjects = document.getElementById("stat-objects");
 const statPose = document.getElementById("stat-pose");
@@ -180,6 +182,7 @@ function finalizeSession(status) {
       latency_ms: status.latency_ms ?? 0,
     };
     activeSession.config = status.config || {};
+    activeSession.sourceLabel = status.source_label || "";
     activeSession.lastV3Summary = status.gemini?.scene_summary || "";
     activeSession.finalTracks = status.tracks || [];
     activeSession.finalAlerts = status.alerts || [];
@@ -229,9 +232,12 @@ function buildSessionMarkdown(session) {
   const layers = [
     ["Objects", config.show_objects],
     ["Pose / skeleton", config.show_pose],
+    ["Joint tags", config.show_pose_labels],
     ["Face", config.show_face],
     ["Hands", config.show_hands],
     ["Expressions", config.show_expressions],
+    ["Segmentation masks", config.show_masks],
+    ["Identity", config.show_identity],
     ["YUBI v3.0", config.show_gemini],
   ];
 
@@ -240,6 +246,9 @@ function buildSessionMarkdown(session) {
   md += `## Session overview\n\n`;
   md += `| Field | Value |\n| --- | --- |\n`;
   md += `| Session ID | \`${session.id}\` |\n`;
+  if (session.sourceLabel) {
+    md += `| Input source | ${escapeMd(session.sourceLabel)} |\n`;
+  }
   md += `| Started (UTC) | ${started} |\n`;
   md += `| Ended (UTC) | ${ended} |\n`;
   md += `| Duration | ${duration} |\n`;
@@ -326,6 +335,7 @@ function serializeSession(session) {
     finalAlerts: session.finalAlerts,
     lastV3Summary: session.lastV3Summary,
     config: session.config,
+    sourceLabel: session.sourceLabel,
     degraded: session.degraded,
     fpsSamples: session.fpsSamples,
   };
@@ -487,6 +497,9 @@ function updateTelemetry(data) {
   }
   telemetryFrame.textContent = String(data.frame_index ?? 0);
   telemetryUptime.textContent = formatUptime(data.uptime_sec ?? 0);
+  if (telemetrySource) {
+    telemetrySource.textContent = (data.source_label || "WEBCAM").toUpperCase();
+  }
   maybeRecoverLiveStream(data.frame_index, data.fps);
 }
 
@@ -498,6 +511,8 @@ function updatePipelineRail(config, gemini, expressions) {
     face: config.show_face,
     hands: config.show_hands,
     expressions: config.show_expressions && Boolean(expressions?.enabled),
+    masks: config.show_masks,
+    identity: config.show_identity && gemini?.enabled,
     v3: config.show_gemini && gemini?.enabled,
   };
   for (const el of pipelineRail.querySelectorAll(".pipe-item")) {
@@ -1233,8 +1248,19 @@ async function startVision() {
   loadingText.textContent = "Starting vision pipeline…";
   idleOverlay.classList.add("hidden");
 
+  const source = sourceInput ? sourceInput.value.trim() : "";
   try {
-    const res = await fetch("/api/start", { method: "POST" });
+    localStorage.setItem("yubi-source", source);
+  } catch {
+    /* storage unavailable */
+  }
+
+  try {
+    const res = await fetch("/api/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ source }),
+    });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       throw new Error(body.detail || "Failed to start vision");
@@ -1464,5 +1490,16 @@ async function hydrateFromServer() {
   }
 }
 
+function restoreSavedSource() {
+  if (!sourceInput) return;
+  try {
+    const saved = localStorage.getItem("yubi-source");
+    if (saved) sourceInput.value = saved;
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+restoreSavedSource();
 hydrateFromServer();
 startTelemetryClock();
