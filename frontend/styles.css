@@ -212,7 +212,7 @@ body {
   text-align: center;
   padding: 20px 28px;
   border-radius: 2px;
-  max-width: 360px;
+  max-width: 420px;
 }
 
 .session-log-title {
@@ -228,6 +228,13 @@ body {
 .session-log-summary {
   font-size: 0.78rem;
   color: var(--accent-muted);
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
+.session-log-hint {
+  font-size: 0.72rem;
+  color: rgba(232, 234, 237, 0.42);
   line-height: 1.45;
   margin-bottom: 14px;
 }

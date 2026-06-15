@@ -90,6 +90,11 @@ class Settings(BaseSettings):
     # Downscale camera frames before inference (major FPS win on 1080p webcams).
     processing_max_width: int = Field(default=1280, ge=640, le=1920)
     stream_jpeg_quality: int = Field(default=80, ge=50, le=95)
+    # Remote live (YouTube HLS, RTSP): MJPEG publisher vs inference cadence.
+    live_stream_fps: int = Field(default=20, ge=5, le=30)
+    live_inference_fps: float = Field(default=2.0, ge=0.5, le=10.0)
+    # When true, remote live sessions start with objects-only overlays (smoother).
+    live_remote_lite: bool = True
 
     @property
     def gemini_active(self) -> bool:

@@ -66,7 +66,8 @@ const feedCount = document.getElementById("feed-count");
 const fpsSparkline = document.getElementById("fps-sparkline");
 const sessionLogActions = document.getElementById("session-log-actions");
 const sessionLogSummary = document.getElementById("session-log-summary");
-const btnDownloadLog = document.getElementById("btn-download-log");
+const btnDownloadRaw = document.getElementById("btn-download-raw");
+const btnDownloadEnriched = document.getElementById("btn-download-enriched");
 const btnDismissLog = document.getElementById("btn-dismiss-log");
 const reportOverlay = document.getElementById("report-overlay");
 const reportStatus = document.getElementById("report-status");
@@ -92,6 +93,8 @@ let logDownloadBusy = false;
 let clockTimer = null;
 let lastPipelineFrame = 0;
 let lastPipelineFrameAt = 0;
+let lastStreamFrameSeq = 0;
+let lastStreamFrameAt = 0;
 let lastStreamReloadAt = 0;
 let feedEntries = [];
 const seenFeedKeys = new Set();
@@ -218,6 +221,7 @@ function finalizeSession(status) {
     activeSession.finalAlerts = status.alerts || [];
     activeSession.degraded = status.degraded || [];
     activeSession.recorded = Boolean(status.recording);
+    activeSession.v3Available = Boolean(status.gemini?.enabled);
   }
   logSessionEvent("sys", "Session terminated");
   completedSession = activeSession;
@@ -237,10 +241,59 @@ function showSessionLogActions() {
     : "—";
   const events = completedSession.events.length;
   sessionLogSummary.textContent = `${completedSession.id} · ${duration} · ${events} events logged`;
+  if (btnDownloadEnriched) {
+    btnDownloadEnriched.disabled = !completedSession.v3Available;
+    btnDownloadEnriched.title = completedSession.v3Available
+      ? "Run multi-pass YUBI v3.0 enrichment"
+      : "YUBI v3.0 is not configured for this session";
+  }
   sessionLogActions.hidden = false;
 }
 
-function buildSessionMarkdown(session) {
+function condenseSessionEvents(events) {
+  const filtered = [];
+  for (const entry of events) {
+    if (entry.tag === "v3" && entry.message === "Scene analysis updated") {
+      continue;
+    }
+    filtered.push(entry);
+  }
+
+  const condensed = [];
+  for (const entry of filtered) {
+    const key = `${entry.tag}\0${entry.message}`;
+    const prev = condensed[condensed.length - 1];
+    if (prev && prev._key === key) {
+      prev._count += 1;
+      prev._lastAt = entry.at;
+      continue;
+    }
+    condensed.push({
+      ...entry,
+      _key: key,
+      _count: 1,
+      _firstAt: entry.at,
+      _lastAt: entry.at,
+    });
+  }
+
+  return condensed.map(({ _key, _count, _firstAt, _lastAt, ...entry }) => {
+    if (_count <= 1) {
+      return entry;
+    }
+    const start = formatLogTimestamp(_firstAt);
+    const end = formatLogTimestamp(_lastAt);
+    const timeSpan =
+      _firstAt === _lastAt ? start : `${start}–${end.slice(11)}`;
+    return {
+      ...entry,
+      at: _firstAt,
+      message: `${entry.message} (×${_count}, ${timeSpan})`,
+    };
+  });
+}
+
+function buildSessionMarkdown(session, { condensed = false } = {}) {
   const started = formatLogTimestamp(session.startedAt);
   const ended = session.endedAt ? formatLogTimestamp(session.endedAt) : "—";
   const duration =
@@ -336,13 +389,19 @@ function buildSessionMarkdown(session) {
 
   md += `## Event chronology\n\n`;
   md += `| Time (UTC) | Type | Event |\n| --- | --- | --- |\n`;
-  for (const entry of session.events) {
+  const chronology = condensed
+    ? condenseSessionEvents(session.events)
+    : session.events;
+  for (const entry of chronology) {
     const type = LOG_TAG_LABELS[entry.tag] || entry.tag;
     let message = escapeMd(entry.message);
-    if (entry.summary) {
+    if (!condensed && entry.summary) {
       message += ` — ${escapeMd(entry.summary)}`;
     }
     md += `| ${formatLogTimestamp(entry.at)} | ${type} | ${message} |\n`;
+  }
+  if (condensed && session.events.length > chronology.length) {
+    md += `\n*Chronology condensed: ${session.events.length} raw events → ${chronology.length} rows.*\n`;
   }
   md += `\n`;
 
@@ -392,24 +451,45 @@ function hideReportOverlay() {
   if (reportOverlay) reportOverlay.hidden = true;
 }
 
-function saveMarkdownFile(markdown, session) {
+function saveMarkdownFile(markdown, session, { raw = false } = {}) {
   const blob = new Blob([markdown], { type: "text/markdown;charset=utf-8" });
   const stamp = session.endedAt
     ? session.endedAt.replace(/[:.]/g, "-").slice(0, 19)
     : new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const suffix = raw ? "raw" : "report";
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = `yubi-session-${session.id}-${stamp}.md`;
+  a.download = `yubi-session-${session.id}-${suffix}-${stamp}.md`;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
-async function downloadSessionLog() {
-  if (!completedSession || logDownloadBusy) return;
-  logDownloadBusy = true;
-  btnDownloadLog.disabled = true;
+function setSessionLogButtonsBusy(busy) {
+  logDownloadBusy = busy;
+  if (btnDownloadRaw) btnDownloadRaw.disabled = busy;
+  if (btnDownloadEnriched) {
+    btnDownloadEnriched.disabled =
+      busy || !completedSession?.v3Available;
+  }
+}
 
-  const draft = buildSessionMarkdown(completedSession);
+function downloadRawSessionLog() {
+  if (!completedSession || logDownloadBusy) return;
+  setSessionLogButtonsBusy(true);
+  try {
+    const markdown = buildSessionMarkdown(completedSession, { condensed: true });
+    saveMarkdownFile(markdown, completedSession, { raw: true });
+    showToast("Raw session log downloaded");
+  } finally {
+    setSessionLogButtonsBusy(false);
+  }
+}
+
+async function downloadEnrichedSessionLog() {
+  if (!completedSession || logDownloadBusy || !completedSession.v3Available) return;
+  setSessionLogButtonsBusy(true);
+
+  const draft = buildSessionMarkdown(completedSession, { condensed: true });
   let finalMd = draft;
   let enriched = false;
 
@@ -469,8 +549,7 @@ async function downloadSessionLog() {
     showToast(
       enriched ? "YUBI v3.0 session report downloaded" : "Session report downloaded"
     );
-    logDownloadBusy = false;
-    btnDownloadLog.disabled = false;
+    setSessionLogButtonsBusy(false);
   }
 }
 
@@ -503,17 +582,36 @@ function reconnectLiveStream(reason) {
   pushFeed("sys", reason || "Refreshing live feed", new Date().toTimeString().slice(0, 8));
 }
 
-function maybeRecoverLiveStream(frameIndex, fps) {
-  if (!isLive || frameIndex == null) return;
+function maybeRecoverLiveStream(data) {
+  if (!isLive) return;
   const now = Date.now();
+  const remoteLive =
+    data.source_kind === "youtube" || data.source_kind === "stream";
+
+  if (remoteLive && data.stream_frame_seq != null) {
+    if (data.stream_frame_seq !== lastStreamFrameSeq) {
+      lastStreamFrameSeq = data.stream_frame_seq;
+      lastStreamFrameAt = now;
+      return;
+    }
+    // Remote live MJPEG is decoupled from inference — use stream seq, not frame_index.
+    if (now - lastStreamFrameAt < 8000) return;
+    const streamFps = data.stream_fps ?? 0;
+    if (streamFps > 2) return;
+    reconnectLiveStream("Live stream stalled — refreshing feed");
+    lastStreamFrameAt = now;
+    return;
+  }
+
+  const frameIndex = data.frame_index;
+  if (frameIndex == null) return;
   if (frameIndex !== lastPipelineFrame) {
     lastPipelineFrame = frameIndex;
     lastPipelineFrameAt = now;
     return;
   }
-  // Only reload MJPEG when the pipeline is truly stalled (not just slow).
   if (now - lastPipelineFrameAt < 6000) return;
-  if (fps != null && fps > 2) return;
+  if (data.fps != null && data.fps > 2) return;
   reconnectLiveStream("Pipeline stalled — refreshing live feed");
   lastPipelineFrameAt = now;
 }
@@ -530,7 +628,7 @@ function updateTelemetry(data) {
   if (telemetrySource) {
     telemetrySource.textContent = (data.source_label || "WEBCAM").toUpperCase();
   }
-  maybeRecoverLiveStream(data.frame_index, data.fps);
+  maybeRecoverLiveStream(data);
 }
 
 function updatePipelineRail(config, gemini, expressions) {
@@ -776,8 +874,9 @@ function updateSourceCacheHint() {
   sourceCacheHint.hidden = false;
 }
 
-function maybeAnnounceYoutubeCache(sourceKind) {
+function maybeAnnounceYoutubeCache(sourceKind, sourceLabel) {
   if (sourceKind !== "youtube" || !youtubeCacheDir || youtubeCacheAnnounced) return;
+  if (sourceLabel?.includes("LIVE")) return;
   youtubeCacheAnnounced = true;
   showToast(`YouTube cache: ${youtubeCacheDir}`, 4500);
 }
@@ -792,6 +891,8 @@ function applyLiveUI() {
   stream.classList.add("live");
   lastPipelineFrame = 0;
   lastPipelineFrameAt = Date.now();
+  lastStreamFrameSeq = 0;
+  lastStreamFrameAt = Date.now();
   lastStreamReloadAt = 0;
   btnStart.disabled = true;
   setLiveControls(true);
@@ -1351,7 +1452,7 @@ async function refreshStatus() {
       renderDetections(data.tracks, data.objects);
       syncLayerChips(data.config);
       lastLiveConfig = data.config;
-      maybeAnnounceYoutubeCache(data.source_kind);
+      maybeAnnounceYoutubeCache(data.source_kind, data.source_label);
       if (activeSession && data.gemini?.scene_summary) {
         const summary = data.gemini.scene_summary;
         if (summary !== activeSession.lastV3Summary) {
@@ -1471,25 +1572,21 @@ async function takeSnapshot() {
   btnSnapshot.disabled = true;
 
   const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  let saved = 0;
+  let saved = false;
 
-  for (const [path, name] of [
-    ["/api/snapshot", `snapshot-${stamp}.png`],
-    ["/api/snapshot/json", `snapshot-${stamp}.json`],
-  ]) {
-    try {
-      const res = await fetch(path);
-      if (!res.ok) continue;
+  try {
+    const res = await fetch("/api/snapshot");
+    if (res.ok) {
       const blob = await res.blob();
       const a = document.createElement("a");
       a.href = URL.createObjectURL(blob);
-      a.download = name;
+      a.download = `snapshot-${stamp}.png`;
       a.click();
       URL.revokeObjectURL(a.href);
-      saved += 1;
-    } catch {
-      /* skip */
+      saved = true;
     }
+  } catch {
+    /* skip */
   }
 
   snapshotBusy = false;
@@ -1498,10 +1595,7 @@ async function takeSnapshot() {
   }
   if (saved && activeSession) {
     activeSession.snapshotCount += 1;
-    logSessionEvent(
-      "capture",
-      `Snapshot exported (${saved} file${saved > 1 ? "s" : ""})`
-    );
+    logSessionEvent("capture", "Snapshot exported");
   }
   showToast(saved ? "Capture exported" : "Capture failed — retry");
 }
@@ -1542,7 +1636,8 @@ btnStop.addEventListener("click", stopVision);
 btnSnapshot.addEventListener("click", takeSnapshot);
 btnRecord.addEventListener("click", toggleRecording);
 btnRetry.addEventListener("click", retryVision);
-btnDownloadLog.addEventListener("click", downloadSessionLog);
+btnDownloadRaw.addEventListener("click", downloadRawSessionLog);
+btnDownloadEnriched.addEventListener("click", downloadEnrichedSessionLog);
 btnDismissLog.addEventListener("click", hideSessionLogActions);
 
 if (layerToggles) {
