@@ -25,10 +25,12 @@ class StartRequest(BaseModel):
 
     `source` may be a local video path, an RTSP/HTTP(S) stream URL, a YouTube
     URL, or a webcam index ("0"). When omitted, the configured default
-    (CAMERA_SOURCE or webcam) is used.
+    (CAMERA_SOURCE or webcam) is used. `profile` selects a layer preset
+    (general / interview / security); defaults to DEFAULT_PROFILE.
     """
 
     source: Optional[str] = None
+    profile: Optional[str] = None
 
 
 class GeminiObjectResponse(BaseModel):
@@ -51,11 +53,15 @@ class HealthResponse(BaseModel):
     app: str
     vision_state: str
     youtube_cache_dir: str = ""
+    profiles: list[dict[str, Any]] = Field(default_factory=list)
+    default_profile: str = "general"
+    report_steps: list[str] = Field(default_factory=list)
 
 
 class StartResponse(BaseModel):
     state: str
     source_label: str = ""
+    profile: str = ""
 
 
 class SessionReportRequest(BaseModel):
@@ -86,6 +92,8 @@ class StatusResponse(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     gemini: dict[str, Any] = Field(default_factory=dict)
     expressions: dict[str, Any] = Field(default_factory=dict)
+    insights: dict[str, Any] = Field(default_factory=dict)
+    ai_usage: dict[str, Any] = Field(default_factory=dict)
     error: Optional[str] = None
     session_id: str = ""
     frame_index: int = 0
@@ -95,3 +103,7 @@ class StatusResponse(BaseModel):
     source_is_live: bool = False
     stream_frame_seq: int = 0
     stream_fps: float = 0.0
+    profile: str = "general"
+    media_position_sec: float = 0.0
+    media_duration_sec: float = 0.0
+    processing_speed: float = 0.0

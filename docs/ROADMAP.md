@@ -35,8 +35,21 @@ Production evolution plan. Items are ordered; earlier phases unblock later ones.
 - [x] YUBI v3.0 semantic layer (scene summary, boxes, label reconciliation)
 - [x] Micro-expression mode (blendshapes + facial mesh overlay)
 - [x] Post-session markdown report with multi-pass v3.0 enrichment
+- [x] FACS expression engine (22 AUs, adaptive baselines, micro/macro episodes, speech gating, blink/gaze/head/self-touch, experimental pulse)
+- [x] Event-driven behavioral insights + running summary (YUBI v3.0)
+- [x] AI cost controls: shared budgeted client, change-gated scene analysis, session/rate caps, credit-exhaustion pause
+- [x] Analysis profiles (General / Interview / Security) and media-time file playback
+- [x] Expression history timeline export (`/api/analysis/export`) and measured analysis section in reports
 - Line/zone counting (supervision `LineZone`, `PolygonZone`)
-- Expression history timeline export (beyond current session log)
+
+## Phase 4b — Behavioral analysis depth
+
+- Audio track: prosody (pitch, pause, rate) aligned with facial episodes; real speech detection instead of jaw-motion heuristics
+- Cross-cut subject re-identification (face embeddings) so one person keeps one subject ID across edits
+- Offline "analyze file" mode: run faster than real time with full-frame-rate face analysis, then scrub the timeline
+- Clickable episode timeline that seeks recorded playback to the apex frame
+- Per-subject comparison report (question/answer segments for interviews)
+- Validation set + metrics for AU and micro-expression detection (precision vs. annotated clips)
 
 ## Phase 5 — Production ops
 

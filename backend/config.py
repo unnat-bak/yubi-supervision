@@ -34,7 +34,12 @@ class Settings(BaseSettings):
     # The /api/start endpoint can override this per-session.
     camera_source: Optional[str] = None  # noqa: UP045
     # Loop file/clip sources when they reach the end (continuous feed for analysis).
+    # The interview profile always plays once so the session ends at EOF.
     source_loop: bool = True
+    # Pace file playback at 1x so overlays and media timestamps track the video.
+    source_realtime_pacing: bool = True
+    # Analysis profile applied on start when the request does not pick one.
+    default_profile: str = "general"
     # Preferred yt-dlp format selector when resolving a YouTube/stream URL.
     youtube_format: str = "best[ext=mp4][height<=1080]/best[height<=1080]/best"
     # Local folder for YouTube clips (default: system temp / yubi-supervision / youtube).
@@ -60,8 +65,17 @@ class Settings(BaseSettings):
 
     gemini_api_key: str = ""
     gemini_enabled: bool = True
-    gemini_model: str = "gemini-2.5-flash"
-    gemini_interval_sec: float = Field(default=3.0, ge=2.0, le=30.0)
+    # Perception tier: scene boxes, label verification, identity (high volume, cheap).
+    gemini_model: str = "gemini-3.5-flash-lite"
+    # Reasoning tier: event-driven behavioral insights and the session report.
+    gemini_insight_model: str = "gemini-3.8-flash"
+    # Image detail for perception calls: low | medium | high | auto (model default).
+    gemini_media_resolution: str = "low"
+    # Minimum seconds between scene passes; unchanged scenes back off toward the max.
+    gemini_interval_sec: float = Field(default=4.0, ge=2.0, le=30.0)
+    gemini_max_interval_sec: float = Field(default=60.0, ge=5.0, le=600.0)
+    # Mean abs pixel delta (0-255, on a tiny grayscale thumbnail) that counts as change.
+    gemini_scene_change_threshold: float = Field(default=6.0, ge=0.5, le=64.0)
     gemini_max_objects: int = Field(default=8, ge=1, le=25)
     # Fraction of processing frame width sent to v3.0 (0.6 = 60% — cheaper, still accurate).
     gemini_analysis_scale: float = Field(default=0.6, ge=0.3, le=1.0)
@@ -72,8 +86,30 @@ class Settings(BaseSettings):
     gemini_verify_below: float = Field(default=0.45, ge=0.1, le=0.9)
     # Confirmed v3.0 labels stick on a tracker_id without re-querying the API.
     gemini_label_cache_sec: float = Field(default=45.0, ge=5.0, le=300.0)
-    # YUBI v3.0 enrichment passes for post-session markdown (1–3).
-    session_report_passes: int = Field(default=3, ge=1, le=3)
+    # Session report passes: 1 = compose, 2 = analyze + compose, 3 = + evidence audit.
+    session_report_passes: int = Field(default=2, ge=1, le=3)
+
+    # AI spend governor shared by every YUBI v3.0 call in a session.
+    # Estimated USD cap per session (0 = unlimited); essential calls (report) bypass it.
+    ai_session_budget_usd: float = Field(default=1.0, ge=0.0, le=100.0)
+    ai_max_calls_per_min: int = Field(default=12, ge=1, le=120)
+    ai_request_timeout_sec: float = Field(default=30.0, ge=5.0, le=300.0)
+
+    # Insight engine: interprets locally detected behavioral events (text digest +
+    # a few apex face crops) instead of streaming frames to the model.
+    insights_enabled: bool = True
+    insight_min_interval_sec: float = Field(default=20.0, ge=5.0, le=600.0)
+    insight_digest_interval_sec: float = Field(default=90.0, ge=15.0, le=1800.0)
+    insight_max_images: int = Field(default=2, ge=0, le=6)
+    # Reasoning depth for insights: minimal | low | medium | high.
+    insight_thinking: str = "low"
+
+    # Local micro-expression engine (no API cost).
+    expression_calibration_sec: float = Field(default=4.0, ge=1.0, le=30.0)
+    # >1 detects subtler movements (more events), <1 only stronger ones.
+    expression_sensitivity: float = Field(default=1.0, ge=0.5, le=2.0)
+    # Experimental camera-based pulse estimate (rPPG) on the primary face.
+    expression_pulse_enabled: bool = True
 
     # Identity layer (YUBI v3.0 vision): name/jersey/descriptor per tracked person.
     identity_enabled: bool = True

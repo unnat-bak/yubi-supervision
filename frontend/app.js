@@ -46,15 +46,28 @@ const expressionError = document.getElementById("expression-error");
 const expressionPulse = document.getElementById("expression-pulse");
 const expressionLiveLabel = document.getElementById("expression-live-label");
 const expressionSignalCount = document.getElementById("expression-signal-count");
-const exprBarBrow = document.getElementById("expr-bar-brow");
-const exprBarEye = document.getElementById("expr-bar-eye");
-const exprBarNose = document.getElementById("expr-bar-nose");
-const exprBarMouth = document.getElementById("expr-bar-mouth");
-const exprRegionBrowVal = document.getElementById("expr-region-brow-val");
-const exprRegionEyeVal = document.getElementById("expr-region-eye-val");
-const exprRegionNoseVal = document.getElementById("expr-region-nose-val");
-const exprRegionMouthVal = document.getElementById("expr-region-mouth-val");
-const exprRegionEls = document.querySelectorAll(".expr-region");
+const expressionSubjects = document.getElementById("expression-subjects");
+const expressionAuCount = document.getElementById("expression-au-count");
+const exprValence = document.getElementById("expr-valence");
+const exprEmotionBars = document.getElementById("expr-emotion-bars");
+const exprTimeline = document.getElementById("expr-timeline");
+const exprTimelineSpan = document.getElementById("expr-timeline-span");
+const exprAuChips = document.getElementById("expr-au-chips");
+const exprRegionEls = document.querySelectorAll(".expr-region[data-region]");
+const exprVitalEls = document.querySelectorAll(".expr-vital[data-vital]");
+const aiSpend = document.getElementById("ai-spend");
+const aiSpendValue = document.getElementById("ai-spend-value");
+const aiSpendFill = document.getElementById("ai-spend-fill");
+const aiSpendNote = document.getElementById("ai-spend-note");
+const insightSection = document.getElementById("insight-section");
+const insightState = document.getElementById("insight-state");
+const insightSummary = document.getElementById("insight-summary");
+const insightList = document.getElementById("insight-list");
+const profileOptions = document.getElementById("profile-options");
+const profileHint = document.getElementById("profile-hint");
+const telemetryMediaItem = document.getElementById("telemetry-media-item");
+const telemetryMedia = document.getElementById("telemetry-media");
+const telemetryProfile = document.getElementById("telemetry-profile");
 const hudOverlay = document.getElementById("hud-overlay");
 const pipelineRail = document.getElementById("pipeline-rail");
 const telemetryUtc = document.getElementById("telemetry-utc");
@@ -69,13 +82,10 @@ const sessionLogSummary = document.getElementById("session-log-summary");
 const btnDownloadRaw = document.getElementById("btn-download-raw");
 const btnDownloadEnriched = document.getElementById("btn-download-enriched");
 const btnDismissLog = document.getElementById("btn-dismiss-log");
+const btnExportAnalysis = document.getElementById("btn-export-analysis");
 const reportOverlay = document.getElementById("report-overlay");
 const reportStatus = document.getElementById("report-status");
-const reportPassItems = [
-  document.getElementById("report-pass-1"),
-  document.getElementById("report-pass-2"),
-  document.getElementById("report-pass-3"),
-];
+const reportPassList = document.getElementById("report-pass-list");
 
 let pollTimer = null;
 let isLive = false;
@@ -98,10 +108,45 @@ let lastStreamFrameAt = 0;
 let lastStreamReloadAt = 0;
 let feedEntries = [];
 const seenFeedKeys = new Set();
+const seenEpisodeIds = new Set();
+const seenInsightIds = new Set();
 let lastGeminiState = null;
 let lastObjectCount = null;
+let lastAiPausedReason = null;
+let lastInsightKey = null;
+let lastEpisodeKey = null;
 const fpsHistory = [];
 const MAX_FPS_HISTORY = 48;
+
+const EMOTION_ROWS = [
+  ["happiness", "Joy"],
+  ["surprise", "Surprise"],
+  ["fear", "Fear"],
+  ["anger", "Anger"],
+  ["disgust", "Disgust"],
+  ["sadness", "Sadness"],
+  ["contempt", "Contempt"],
+];
+const EPISODE_KIND_LABELS = { micro: "MICRO", macro: "MACRO", behavior: "CUE" };
+const EXPRESSION_STATE_LABELS = {
+  off: "OFF",
+  idle: "IDLE",
+  no_face: "NO FACE",
+  calibrating: "CAL",
+  live: "LIVE",
+};
+const INSIGHT_STATE_LABELS = {
+  off: "OFF",
+  idle: "IDLE",
+  watching: "WATCH",
+  thinking: "RUN",
+  paused: "PAUSED",
+};
+const DEFAULT_REPORT_STEPS = ["Analyzing behavioral evidence", "Composing intelligence brief"];
+
+let profileChoices = [];
+let selectedProfile = "general";
+let reportSteps = DEFAULT_REPORT_STEPS;
 
 const videoWrap = document.getElementById("video-wrap");
 const btnFocus = document.getElementById("btn-focus");
@@ -158,6 +203,20 @@ function formatLogTimestamp(iso) {
   return d.toISOString().replace("T", " ").slice(0, 19);
 }
 
+function formatMediaClock(seconds) {
+  const total = Math.max(0, Number(seconds) || 0);
+  const m = Math.floor(total / 60);
+  const s = total - m * 60;
+  return `${String(m).padStart(2, "0")}:${s.toFixed(1).padStart(4, "0")}`;
+}
+
+function formatTokens(count) {
+  const n = Number(count) || 0;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return String(n);
+}
+
 function formatDurationMs(ms) {
   const total = Math.max(0, Math.floor(ms / 1000));
   const h = Math.floor(total / 3600);
@@ -190,6 +249,8 @@ function beginSession(sessionId) {
     finalAlerts: [],
     fpsSamples: [],
     degraded: [],
+    profile: selectedProfile,
+    mediaDurationSec: 0,
   };
 }
 
@@ -228,6 +289,8 @@ function finalizeSession(status) {
     activeSession.degraded = status.degraded || [];
     activeSession.recorded = Boolean(status.recording);
     activeSession.v3Available = Boolean(status.gemini?.enabled);
+    activeSession.profile = status.profile || activeSession.profile;
+    activeSession.mediaDurationSec = status.media_duration_sec || 0;
   }
   logSessionEvent("sys", "Session terminated");
   completedSession = activeSession;
@@ -338,6 +401,12 @@ function buildSessionMarkdown(session, { condensed = false } = {}) {
   if (session.sourceLabel) {
     md += `| Input source | ${escapeMd(session.sourceLabel)} |\n`;
   }
+  if (session.profile) {
+    md += `| Analysis profile | ${escapeMd(profileLabel(session.profile))} |\n`;
+  }
+  if (session.mediaDurationSec > 0) {
+    md += `| Media length | ${formatDurationMs(session.mediaDurationSec * 1000)} |\n`;
+  }
   md += `| Started (UTC) | ${started} |\n`;
   md += `| Ended (UTC) | ${ended} |\n`;
   md += `| Duration | ${duration} |\n`;
@@ -433,24 +502,67 @@ function serializeSession(session) {
     sourceLabel: session.sourceLabel,
     degraded: session.degraded,
     fpsSamples: session.fpsSamples,
+    profile: session.profile,
+    mediaDurationSec: session.mediaDurationSec,
   };
 }
 
+function renderReportSteps(steps) {
+  if (!reportPassList) return;
+  const labels = steps?.length ? steps : reportSteps;
+  reportPassList.replaceChildren(
+    ...labels.map((label) => {
+      const li = document.createElement("li");
+      li.className = "report-pass-item";
+      li.textContent = label;
+      return li;
+    })
+  );
+}
+
 function setReportPassState(activePass, doneThrough) {
-  for (let i = 0; i < reportPassItems.length; i += 1) {
-    const el = reportPassItems[i];
-    if (!el) continue;
+  if (!reportPassList) return;
+  Array.from(reportPassList.children).forEach((el, i) => {
     const passNum = i + 1;
     el.classList.toggle("active", activePass > 0 && passNum === activePass);
     el.classList.toggle("done", passNum <= doneThrough);
-  }
+  });
 }
 
 function showReportOverlay() {
   if (!reportOverlay) return;
   reportOverlay.hidden = false;
   if (reportStatus) reportStatus.textContent = "Compiling session data…";
+  renderReportSteps(reportSteps);
   setReportPassState(0, 0);
+}
+
+function withAnalysisSection(markdown, analysisMd) {
+  if (!analysisMd || markdown.includes("## Behavioral analysis")) return markdown;
+  const section = `${analysisMd.trim()}\n\n`;
+  const index = markdown.indexOf("## Event chronology");
+  if (index >= 0) {
+    return markdown.slice(0, index) + section + markdown.slice(index);
+  }
+  return `${markdown.trimEnd()}\n\n${section}`;
+}
+
+async function fetchAnalysisMarkdown() {
+  try {
+    const res = await fetch("/api/analysis/report.md");
+    if (!res.ok) return "";
+    return await res.text();
+  } catch {
+    return "";
+  }
+}
+
+function downloadBlob(blob, filename) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(a.href);
 }
 
 function hideReportOverlay() {
@@ -463,29 +575,44 @@ function saveMarkdownFile(markdown, session, { raw = false } = {}) {
     ? session.endedAt.replace(/[:.]/g, "-").slice(0, 19)
     : new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
   const suffix = raw ? "raw" : "report";
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = `yubi-session-${session.id}-${suffix}-${stamp}.md`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  downloadBlob(blob, `yubi-session-${session.id}-${suffix}-${stamp}.md`);
 }
 
 function setSessionLogButtonsBusy(busy) {
   logDownloadBusy = busy;
   if (btnDownloadRaw) btnDownloadRaw.disabled = busy;
+  if (btnExportAnalysis) btnExportAnalysis.disabled = busy;
   if (btnDownloadEnriched) {
     btnDownloadEnriched.disabled =
       busy || !completedSession?.v3Available;
   }
 }
 
-function downloadRawSessionLog() {
+async function downloadRawSessionLog() {
   if (!completedSession || logDownloadBusy) return;
   setSessionLogButtonsBusy(true);
   try {
-    const markdown = buildSessionMarkdown(completedSession, { condensed: true });
+    const draft = buildSessionMarkdown(completedSession, { condensed: true });
+    const markdown = withAnalysisSection(draft, await fetchAnalysisMarkdown());
     saveMarkdownFile(markdown, completedSession, { raw: true });
     showToast("Raw session log downloaded");
+  } finally {
+    setSessionLogButtonsBusy(false);
+  }
+}
+
+async function exportAnalysisTimeline() {
+  if (logDownloadBusy) return;
+  setSessionLogButtonsBusy(true);
+  try {
+    const res = await fetch("/api/analysis/export");
+    if (!res.ok) throw new Error("Export failed");
+    const blob = await res.blob();
+    const id = completedSession?.id || telemetrySession.textContent || "session";
+    downloadBlob(blob, `yubi-analysis-${id}.json`);
+    showToast("Episode timeline exported");
+  } catch {
+    showToast("Timeline export failed — retry");
   } finally {
     setSessionLogButtonsBusy(false);
   }
@@ -498,6 +625,7 @@ async function downloadEnrichedSessionLog() {
   const draft = buildSessionMarkdown(completedSession, { condensed: true });
   let finalMd = draft;
   let enriched = false;
+  let failed = false;
 
   showReportOverlay();
 
@@ -530,6 +658,9 @@ async function downloadEnrichedSessionLog() {
         if (event.message && reportStatus) {
           reportStatus.textContent = event.message;
         }
+        if (event.phase === "compile" && event.steps?.length) {
+          renderReportSteps(event.steps);
+        }
         if (event.phase === "pass") {
           setReportPassState(event.pass, Math.max(0, event.pass - 1));
         }
@@ -538,23 +669,28 @@ async function downloadEnrichedSessionLog() {
           enriched = Boolean(event.enriched);
           setReportPassState(0, event.passes_completed || 0);
         }
-        if (event.phase === "error" && reportStatus) {
-          reportStatus.textContent =
-            event.message || "YUBI v3.0 pass failed — exporting best draft.";
+        if (event.phase === "error") {
+          failed = true;
+          if (reportStatus) {
+            reportStatus.textContent =
+              event.message || "YUBI v3.0 pass failed — exporting best draft.";
+          }
         }
       }
     }
   } catch {
+    failed = true;
     if (reportStatus) {
       reportStatus.textContent = "YUBI v3.0 unavailable — exporting raw session log.";
     }
-    finalMd = draft;
+    finalMd = withAnalysisSection(draft, await fetchAnalysisMarkdown());
   } finally {
     hideReportOverlay();
     saveMarkdownFile(finalMd, completedSession);
-    showToast(
-      enriched ? "YUBI v3.0 session report downloaded" : "Session report downloaded"
-    );
+    let toast = "Session report downloaded";
+    if (enriched) toast = "YUBI v3.0 session report downloaded";
+    else if (failed) toast = "YUBI v3.0 unavailable — downloaded measured report";
+    showToast(toast);
     setSessionLogButtonsBusy(false);
   }
 }
@@ -635,10 +771,22 @@ function updateTelemetry(data) {
   if (telemetrySource) {
     telemetrySource.textContent = (data.source_label || "WEBCAM").toUpperCase();
   }
+  if (telemetryProfile) {
+    telemetryProfile.textContent = profileLabel(data.profile || selectedProfile).toUpperCase();
+  }
+  const duration = data.media_duration_sec || 0;
+  if (telemetryMediaItem) {
+    telemetryMediaItem.hidden = !(duration > 0);
+    if (duration > 0 && telemetryMedia) {
+      const speed = data.processing_speed ? ` · ${data.processing_speed.toFixed(1)}×` : "";
+      telemetryMedia.textContent =
+        `${formatUptime(data.media_position_sec || 0)} / ${formatUptime(duration)}${speed}`;
+    }
+  }
   maybeRecoverLiveStream(data);
 }
 
-function updatePipelineRail(config, gemini, expressions) {
+function updatePipelineRail(config, gemini, expressions, insights) {
   if (!config) return;
   const map = {
     objects: config.show_objects,
@@ -656,20 +804,20 @@ function updatePipelineRail(config, gemini, expressions) {
     const on = Boolean(map[key]);
     el.classList.toggle("active", on);
     const thinking =
-      key === "v3" && gemini?.state === "thinking" ||
-      key === "expressions" && expressions?.state === "thinking";
+      key === "v3" && (gemini?.state === "thinking" || insights?.state === "thinking") ||
+      key === "expressions" && expressions?.state === "calibrating";
     el.classList.toggle("thinking", thinking && on);
   }
 }
 
-function pushFeed(tag, message, time) {
+function pushFeed(tag, message, time, extra = {}) {
   feedEntries.unshift({ tag, message, time });
   if (feedEntries.length > 40) {
     feedEntries.length = 40;
   }
   feedCount.textContent = String(feedEntries.length);
   renderFeed();
-  logSessionEvent(tag, message);
+  logSessionEvent(tag, message, extra);
 }
 
 function renderFeed() {
@@ -694,8 +842,11 @@ function renderFeed() {
 function clearIntelFeed() {
   feedEntries = [];
   seenFeedKeys.clear();
+  seenEpisodeIds.clear();
+  seenInsightIds.clear();
   lastGeminiState = null;
   lastObjectCount = null;
+  lastAiPausedReason = null;
   fpsHistory.length = 0;
   feedCount.textContent = "0";
   renderFeed();
@@ -732,11 +883,33 @@ function ingestIntelFeed(data) {
     pushFeed("alert", `${String(alert.label).toUpperCase()} in frame`, alert.time || time);
   }
 
-  for (const event of expressions?.events || []) {
-    const key = `expr-${event.label}-${event.ts}`;
-    if (seenFeedKeys.has(key)) continue;
-    seenFeedKeys.add(key);
-    pushFeed("expr", event.label, time);
+  for (const episode of [...(expressions?.episodes || [])].reverse()) {
+    if (seenEpisodeIds.has(episode.id)) continue;
+    seenEpisodeIds.add(episode.id);
+    if (!episode.notable) continue;
+    const kind = EPISODE_KIND_LABELS[episode.kind] || episode.kind.toUpperCase();
+    const aus = episode.aus?.length ? ` (${episode.aus.join("+")})` : "";
+    pushFeed("expr", `${kind} ${episode.label}${aus} @ ${formatMediaClock(episode.at)}`, time, {
+      summary: [episode.au_label, ...(episode.cue_labels || [])].filter(Boolean).join(" · "),
+    });
+  }
+
+  for (const insight of [...(data.insights?.insights || [])].reverse()) {
+    if (seenInsightIds.has(insight.id)) continue;
+    seenInsightIds.add(insight.id);
+    pushFeed("v3", `Insight · ${insight.title} @ ${insight.at_clock}`, time, {
+      summary: insight.observation,
+    });
+  }
+
+  const pausedReason = data.ai_usage?.paused ? data.ai_usage.paused_reason || "paused" : null;
+  if (pausedReason !== lastAiPausedReason) {
+    if (pausedReason) {
+      pushFeed("alert", pausedReason, time);
+    } else if (lastAiPausedReason) {
+      pushFeed("v3", "YUBI v3.0 resumed", time);
+    }
+    lastAiPausedReason = pausedReason;
   }
 }
 
@@ -1143,11 +1316,8 @@ function handleAlerts(alerts) {
 function setRecordingUI(recording) {
   isRecording = recording;
   btnRecord.classList.toggle("recording", recording);
-  for (const node of btnRecord.childNodes) {
-    if (node.nodeType === Node.TEXT_NODE) {
-      node.textContent = recording ? "Stop" : "Record";
-    }
-  }
+  const label = document.getElementById("btn-record-label");
+  if (label) label.textContent = recording ? "Stop" : "Record";
 }
 
 function updateDegraded(degraded) {
@@ -1170,26 +1340,12 @@ function clearPanelContent() {
   analysisList.replaceChildren();
   analysisEmpty.hidden = true;
   analysisError.hidden = true;
-  expressionState.textContent = "OFF";
-  expressionState.className = "panel-badge expression-badge";
-  expressionNotes.textContent = "High-precision facial mesh for micro-movement detection.";
-  expressionList.replaceChildren();
-  expressionEmpty.hidden = false;
-  expressionEmpty.textContent = "No micro-signals";
-  expressionError.hidden = true;
-  if (expressionPulse) {
-    expressionPulse.className = "expression-pulse";
-  }
-  if (expressionLiveLabel) {
-    expressionLiveLabel.textContent = "Awaiting face lock";
-  }
-  if (expressionSignalCount) {
-    expressionSignalCount.textContent = "0";
-  }
-  setExpressionRegionActivity("eyebrow", 0);
-  setExpressionRegionActivity("under-eye", 0);
-  setExpressionRegionActivity("nose", 0);
-  setExpressionRegionActivity("mouth", 0);
+  lastInsightKey = null;
+  lastEpisodeKey = null;
+  insightList?.replaceChildren();
+  renderExpressions({ enabled: false, state: "off" });
+  renderInsights(null);
+  renderAiUsage(null, false);
 }
 
 function renderAnalysis(analysis) {
@@ -1203,6 +1359,7 @@ function renderAnalysis(analysis) {
     idle: "IDLE",
     thinking: "RUN",
     ready: "LIVE",
+    paused: "PAUSED",
     error: "FAULT",
   };
 
@@ -1210,7 +1367,9 @@ function renderAnalysis(analysis) {
   analysisState.className = "panel-badge analysis-badge";
   if (analysis.state === "thinking") analysisState.classList.add("thinking");
   if (analysis.state === "ready") analysisState.classList.add("ready");
-  if (analysis.state === "error") analysisState.classList.add("error");
+  if (analysis.state === "error" || analysis.state === "paused") {
+    analysisState.classList.add("error");
+  }
 
   if (!analysis.enabled) {
     analysisSummary.textContent = "YUBI v3.0 is not configured on this server.";
@@ -1221,7 +1380,7 @@ function renderAnalysis(analysis) {
     return;
   }
 
-  if (analysis.error) {
+  if (analysis.error && analysis.state !== "paused") {
     analysisError.textContent = analysis.error;
     analysisError.hidden = false;
   } else {
@@ -1233,7 +1392,9 @@ function renderAnalysis(analysis) {
     analysis.scene_summary ||
     (analysis.state === "thinking"
       ? "Analyzing scene…"
-      : isLive
+      : analysis.state === "paused"
+        ? "Scene analysis paused."
+        : isLive
         ? "Waiting for first YUBI v3.0 analysis…"
         : "Start vision for live analysis.");
 
@@ -1259,55 +1420,241 @@ function renderAnalysis(analysis) {
   syncAnalysisPanelVisibility();
 }
 
-function setExpressionRegionActivity(region, intensity) {
-  const pct = Math.round(Math.max(0, Math.min(1, intensity)) * 100);
-  const label = pct > 0 ? `${pct}%` : "—";
-  if (region === "eyebrow" && exprBarBrow && exprRegionBrowVal) {
-    exprBarBrow.style.width = `${pct}%`;
-    exprRegionBrowVal.textContent = label;
-  } else if (region === "under-eye" && exprBarEye && exprRegionEyeVal) {
-    exprBarEye.style.width = `${pct}%`;
-    exprRegionEyeVal.textContent = label;
-  } else if (region === "nose" && exprBarNose && exprRegionNoseVal) {
-    exprBarNose.style.width = `${pct}%`;
-    exprRegionNoseVal.textContent = label;
-  } else if (region === "mouth" && exprBarMouth && exprRegionMouthVal) {
-    exprBarMouth.style.width = `${pct}%`;
-    exprRegionMouthVal.textContent = label;
+function pct(value) {
+  return Math.round(Math.max(0, Math.min(1, Number(value) || 0)) * 100);
+}
+
+function makeEl(tag, className, text) {
+  const el = document.createElement(tag);
+  if (className) el.className = className;
+  if (text != null) el.textContent = text;
+  return el;
+}
+
+function ensureEmotionRows() {
+  if (!exprEmotionBars || exprEmotionBars.childElementCount) return;
+  for (const [key, label] of EMOTION_ROWS) {
+    const row = makeEl("div", "expr-emotion-row");
+    row.dataset.emotion = key;
+    const bar = makeEl("div", "expr-region-bar");
+    bar.append(makeEl("div", "expr-region-fill"));
+    row.append(makeEl("span", "expr-emotion-label", label), bar, makeEl("span", "expr-region-val", "—"));
+    exprEmotionBars.append(row);
   }
-  for (const el of exprRegionEls) {
-    const regionLabel = el.querySelector(".expr-region-label")?.textContent;
-    const match =
-      (region === "eyebrow" && regionLabel === "Brow") ||
-      (region === "under-eye" && regionLabel === "Under-eye") ||
-      (region === "nose" && regionLabel === "Nose") ||
-      (region === "mouth" && regionLabel === "Mouth");
-    if (match) {
-      el.classList.toggle("active", pct > 12);
+}
+
+function renderEmotionBars(subject) {
+  ensureEmotionRows();
+  const emotions = subject?.emotions || {};
+  const dominant = subject?.dominant?.emotion;
+  for (const row of exprEmotionBars?.children || []) {
+    const level = pct(emotions[row.dataset.emotion]);
+    row.querySelector(".expr-region-fill").style.width = `${level}%`;
+    row.querySelector(".expr-region-val").textContent = level > 0 ? `${level}%` : "—";
+    row.classList.toggle("dominant", row.dataset.emotion === dominant && level >= 25);
+  }
+  if (exprValence) {
+    if (subject && subject.valence != null) {
+      const v = Number(subject.valence);
+      exprValence.textContent =
+        `V ${v >= 0 ? "+" : ""}${v.toFixed(2)} · A ${Number(subject.activation || 0).toFixed(2)}`;
+    } else {
+      exprValence.textContent = "—";
     }
   }
 }
 
+function renderRegions(regions) {
+  for (const el of exprRegionEls) {
+    const level = pct(regions?.[el.dataset.region]);
+    el.querySelector(".expr-region-fill").style.width = `${level}%`;
+    el.querySelector(".expr-region-val").textContent = level > 0 ? `${level}%` : "—";
+    el.classList.toggle("active", level > 12);
+  }
+}
+
+function setVital(key, value, { alert = false, title = "" } = {}) {
+  for (const el of exprVitalEls) {
+    if (el.dataset.vital !== key) continue;
+    el.querySelector(".expr-vital-v").textContent = value;
+    el.classList.toggle("alert", alert);
+    if (title) el.title = title;
+  }
+}
+
+function renderVitals(subject) {
+  if (!subject) {
+    for (const key of ["blink", "gaze", "head", "pulse", "speech", "touch"]) setVital(key, "—");
+    return;
+  }
+  const rate = Number(subject.blink_rate) || 0;
+  const baseline = Number(subject.blink_baseline) || 0;
+  setVital("blink", `${Math.round(rate)}/min`, {
+    alert: baseline > 0 && rate > baseline * 1.5 && rate >= 20,
+    title: `Session average ${Math.round(baseline)}/min · ${subject.blink_total ?? 0} blinks`,
+  });
+  setVital("gaze", subject.gaze_away ? "AWAY" : `ON · ${Math.round(subject.gaze_away_pct || 0)}%`, {
+    alert: Boolean(subject.gaze_away),
+    title: `${subject.gaze_away_pct ?? 0}% of observed time looking away`,
+  });
+  const head = subject.head;
+  setVital("head", head ? `${Math.round(head.pitch)}° / ${Math.round(head.yaw)}°` : "—", {
+    alert: Boolean(head && head.speed > 60),
+    title: "Pitch / yaw (degrees)",
+  });
+  const pulse = subject.pulse;
+  setVital("pulse", pulse ? `${Math.round(pulse.bpm)} bpm${pulse.confidence < 0.5 ? "?" : ""}` : "—");
+  setVital("speech", subject.speaking ? "TALKING" : "QUIET");
+  setVital("touch", subject.self_touch ? "FACE" : "—", { alert: Boolean(subject.self_touch) });
+}
+
+function renderAuChips(aus) {
+  if (!exprAuChips) return;
+  exprAuChips.replaceChildren(
+    ...aus.map((au) => {
+      const level = pct(au.level);
+      const chip = makeEl("span", "expr-au-chip", `${au.code} ${level}%`);
+      chip.title = au.name;
+      chip.style.setProperty("--level", `${level}%`);
+      return chip;
+    })
+  );
+  if (expressionAuCount) expressionAuCount.textContent = String(aus.length);
+}
+
+function renderEpisodes(episodes, counts) {
+  const total = (counts?.micro || 0) + (counts?.macro || 0) + (counts?.behavior || 0);
+  if (expressionSignalCount) {
+    expressionSignalCount.textContent = total ? `${counts.micro || 0} µ · ${total}` : "0";
+    expressionSignalCount.title =
+      `${counts?.micro || 0} micro · ${counts?.macro || 0} macro · ${counts?.behavior || 0} behavioral`;
+  }
+  expressionEmpty.hidden = episodes.length > 0;
+  const key = episodes.map((e) => e.id).join(",");
+  if (key === lastEpisodeKey) return;
+  lastEpisodeKey = key;
+  expressionList.replaceChildren(
+    ...episodes.map((episode) => {
+      const li = makeEl("li", `expression-item episode-${episode.kind}`);
+      if (episode.notable) li.classList.add("active");
+      const head = makeEl("div", "episode-head");
+      head.append(
+        makeEl("span", "episode-kind", EPISODE_KIND_LABELS[episode.kind] || episode.kind),
+        makeEl("span", "expression-item-label", episode.label),
+        makeEl("span", "expression-item-meta", formatMediaClock(episode.at))
+      );
+      const side = episode.side === "bilateral" ? "bilateral" : episode.side ? `side ${episode.side}` : "";
+      const details = [
+        episode.aus?.length ? episode.aus.join("+") : "",
+        episode.duration_ms ? `${episode.duration_ms} ms` : "",
+        side,
+        episode.speaking ? "speaking" : "",
+        ...(episode.cue_labels || []).filter((cue) => !episode.label.startsWith(cue)),
+      ].filter(Boolean);
+      const meta = makeEl("span", "episode-meta", details.join(" · "));
+      meta.title = episode.au_label || "";
+      li.append(head, meta);
+      return li;
+    })
+  );
+}
+
+function drawExpressionTimeline(points, episodes, subjectId) {
+  if (!exprTimeline) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = exprTimeline.clientWidth || 384;
+  const h = exprTimeline.clientHeight || 64;
+  if (exprTimeline.width !== Math.round(w * dpr) || exprTimeline.height !== Math.round(h * dpr)) {
+    exprTimeline.width = Math.round(w * dpr);
+    exprTimeline.height = Math.round(h * dpr);
+  }
+  const ctx = exprTimeline.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  const mid = h / 2;
+  ctx.strokeStyle = "rgba(232, 234, 237, 0.08)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(w, mid);
+  ctx.stroke();
+  if (points.length < 2) {
+    if (exprTimelineSpan) exprTimelineSpan.textContent = "—";
+    return;
+  }
+  const end = points[points.length - 1].t;
+  const start = Math.min(points[0].t, end - 10);
+  const span = Math.max(end - start, 1);
+  const x = (t) => ((t - start) / span) * (w - 2) + 1;
+  if (exprTimelineSpan) exprTimelineSpan.textContent = `last ${Math.round(span)}s`;
+
+  ctx.fillStyle = "rgba(142, 184, 176, 0.12)";
+  ctx.beginPath();
+  ctx.moveTo(x(points[0].t), h);
+  for (const p of points) ctx.lineTo(x(p.t), h - Math.max(0, Math.min(1, p.a)) * (h - 4));
+  ctx.lineTo(x(end), h);
+  ctx.closePath();
+  ctx.fill();
+
+  for (const episode of episodes) {
+    if (subjectId && episode.subject !== subjectId) continue;
+    if (episode.at < start || episode.at > end) continue;
+    const ex = x(episode.at);
+    if (episode.kind === "micro") {
+      ctx.strokeStyle = "rgba(201, 168, 106, 0.9)";
+      ctx.lineWidth = 1.5;
+    } else if (episode.kind === "macro") {
+      ctx.strokeStyle = "rgba(232, 234, 237, 0.45)";
+      ctx.lineWidth = 1;
+    } else {
+      ctx.strokeStyle = "rgba(142, 184, 176, 0.35)";
+      ctx.lineWidth = 1;
+    }
+    ctx.beginPath();
+    ctx.moveTo(ex, episode.kind === "behavior" ? h - 8 : 2);
+    ctx.lineTo(ex, h);
+    ctx.stroke();
+  }
+
+  ctx.strokeStyle = "rgba(142, 184, 176, 0.9)";
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  points.forEach((p, i) => {
+    const y = mid - Math.max(-1, Math.min(1, p.v)) * (mid - 3);
+    if (i === 0) ctx.moveTo(x(p.t), y);
+    else ctx.lineTo(x(p.t), y);
+  });
+  ctx.stroke();
+}
+
+function expressionLiveText(expr, subject) {
+  if (!expr.enabled) return "Expression tracking off";
+  if (!subject) return expr.state === "no_face" ? "Awaiting face lock" : "Expression tracking idle";
+  if (!subject.calibrated) {
+    return `Calibrating ${subject.id} baseline — keep a relaxed face (${subject.calibration_pct}%)`;
+  }
+  const dominant = subject.dominant || {};
+  const speech = subject.speaking ? " · speaking" : "";
+  if (!dominant.emotion || dominant.emotion === "neutral" || dominant.score < 0.25) {
+    return `Neutral — at baseline${speech}`;
+  }
+  return `${dominant.label} ${pct(dominant.score)}%${speech}`;
+}
+
 function renderExpressions(expr) {
   if (!expr) return;
-  const videoWrap = document.getElementById("video-wrap");
-  const showPanel = isLive && expr.enabled;
+  const showPanel = isLive && Boolean(expr.enabled);
   expressionPanel.hidden = !showPanel;
   videoWrap.classList.toggle("expressions-live", showPanel);
 
-  const stateLabels = {
-    disabled: "OFF",
-    idle: "IDLE",
-    thinking: "RUN",
-    ready: "LIVE",
-    error: "FAULT",
-  };
-
-  expressionState.textContent = stateLabels[expr.state] || expr.state;
+  const subjects = expr.subjects || [];
+  const subject = subjects[0] || null;
+  let badge = EXPRESSION_STATE_LABELS[expr.state] || String(expr.state || "off").toUpperCase();
+  if (expr.state === "calibrating" && subject) badge = `CAL ${subject.calibration_pct}%`;
+  expressionState.textContent = badge;
   expressionState.className = "panel-badge expression-badge";
-  if (expr.state === "thinking") expressionState.classList.add("thinking");
-  if (expr.state === "ready") expressionState.classList.add("ready");
-  if (expr.state === "error") expressionState.classList.add("error");
+  if (expr.state === "live") expressionState.classList.add("ready");
+  if (expr.state === "calibrating") expressionState.classList.add("thinking");
 
   if (expr.error) {
     expressionError.textContent = expr.error;
@@ -1317,84 +1664,99 @@ function renderExpressions(expr) {
     expressionError.textContent = "";
   }
 
-  const cues = expr.micro_cues || [];
-  const events = expr.events || [];
-  const browIntensity = events
-    .filter((e) => e.region === "eyebrow")
-    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
-  const eyeIntensity = events
-    .filter((e) => e.region === "under-eye")
-    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
-  const noseIntensity = events
-    .filter((e) => e.region === "nose")
-    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
-  const mouthIntensity = events
-    .filter((e) => e.region === "mouth")
-    .reduce((max, e) => Math.max(max, e.intensity || 0), 0);
-
-  setExpressionRegionActivity("eyebrow", browIntensity);
-  setExpressionRegionActivity("under-eye", eyeIntensity);
-  setExpressionRegionActivity("nose", noseIntensity);
-  setExpressionRegionActivity("mouth", mouthIntensity);
-
   if (expressionPulse) {
     expressionPulse.className = "expression-pulse";
-    if (expr.state === "thinking") {
+    if (expr.state === "calibrating") {
       expressionPulse.classList.add("thinking");
-    } else if (events.length > 0) {
+    } else if (subject?.aus?.some((au) => au.level >= 0.3)) {
       expressionPulse.classList.add("active");
     }
   }
-  if (expressionLiveLabel) {
-    if (expr.state === "thinking") {
-      expressionLiveLabel.textContent = "Mapping facial structure…";
-    } else if (events.length > 0) {
-      expressionLiveLabel.textContent = `${events.length} micro-signal${events.length === 1 ? "" : "s"} active`;
-    } else if (expr.state === "ready") {
-      expressionLiveLabel.textContent = "Tracking — mesh locked";
+  if (expressionLiveLabel) expressionLiveLabel.textContent = expressionLiveText(expr, subject);
+  if (expressionSubjects) {
+    expressionSubjects.textContent = subjects.length > 1
+      ? subjects.map((s) => s.id).join(" · ")
+      : subject ? `SUBJ ${subject.id}` : "";
+  }
+
+  renderEmotionBars(subject);
+  drawExpressionTimeline(expr.timeline || [], expr.episodes || [], subject?.id);
+  renderRegions(subject?.regions);
+  renderVitals(subject);
+  renderAuChips(subject?.aus || []);
+  if (expressionNotes) {
+    expressionNotes.hidden = Boolean(subject?.aus?.length);
+  }
+  renderEpisodes(expr.episodes || [], expr.counts || {});
+}
+
+function renderInsights(insights) {
+  if (!insightSection) return;
+  const items = insights?.insights || [];
+  const visible = isLive && Boolean(insights?.enabled) &&
+    (insights.state !== "idle" || items.length > 0);
+  insightSection.hidden = !visible;
+  if (!visible) return;
+
+  insightState.textContent = INSIGHT_STATE_LABELS[insights.state] || insights.state.toUpperCase();
+  insightState.className = "panel-badge analysis-badge";
+  if (insights.state === "thinking") insightState.classList.add("thinking");
+  if (insights.state === "paused") insightState.classList.add("error");
+
+  let summary = insights.running_summary || "";
+  if (!summary) {
+    if (insights.state === "paused") {
+      summary = "Interpretation paused — measured analysis continues and is kept for the report.";
+    } else if (insights.pending) {
+      summary = `${insights.pending} notable moment${insights.pending === 1 ? "" : "s"} queued for interpretation.`;
     } else {
-      expressionLiveLabel.textContent = "Awaiting face lock";
+      summary = "Watching for notable moments — interpretation runs only on new evidence.";
     }
   }
+  insightSummary.textContent = summary;
 
-  expressionNotes.textContent =
-    expr.structure_notes ||
-    (cues.length ? cues.join(" · ") : "Monitoring brow, under-eye, nose, and mouth micro-movements.");
+  const key = items.map((i) => i.id).join(",");
+  if (key === lastInsightKey) return;
+  lastInsightKey = key;
+  insightList.replaceChildren(
+    ...items.map((insight) => {
+      const li = makeEl("li", `insight-item insight-${insight.category}`);
+      const head = makeEl("div", "insight-head");
+      head.append(
+        makeEl("span", "insight-time", insight.at_clock),
+        makeEl("span", "insight-title", insight.title),
+        makeEl("span", "insight-confidence", `${pct(insight.confidence)}%`)
+      );
+      li.append(head, makeEl("p", "insight-observation", insight.observation));
+      if (insight.interpretation) {
+        li.append(makeEl("p", "insight-interpretation", insight.interpretation));
+      }
+      if (insight.evidence?.length) {
+        li.title = `Evidence: ${insight.evidence.join(", ")}`;
+      }
+      return li;
+    })
+  );
+}
 
-  expressionList.replaceChildren();
-  const items = events.length
-    ? events
-    : cues.map((c) => ({ label: c, intensity: null, region: "" }));
-
-  if (expressionSignalCount) {
-    expressionSignalCount.textContent = String(events.length);
-  }
-  expressionEmpty.hidden = items.length > 0 || expr.state === "thinking";
-  expressionEmpty.textContent =
-    expr.state === "thinking" ? "Analyzing face structure…" : "No micro-movements detected";
-
-  for (const item of items) {
-    const li = document.createElement("li");
-    li.className = "expression-item";
-    if (item.intensity != null && item.intensity > 0.1) {
-      li.classList.add("active");
-    }
-    const label = document.createElement("span");
-    label.className = "expression-item-label";
-    label.textContent = item.label;
-    const meta = document.createElement("span");
-    meta.className = "expression-item-meta";
-    meta.textContent =
-      item.intensity != null ? `${Math.round(item.intensity * 100)}%` : "cue";
-    const bar = document.createElement("div");
-    bar.className = "expression-item-bar";
-    const fill = document.createElement("div");
-    fill.className = "expression-item-fill";
-    fill.style.width =
-      item.intensity != null ? `${Math.round(item.intensity * 100)}%` : "18%";
-    bar.append(fill);
-    li.append(label, meta, bar);
-    expressionList.appendChild(li);
+function renderAiUsage(usage, enabled) {
+  if (!aiSpend) return;
+  const visible = isLive && enabled && usage && Object.keys(usage).length > 0;
+  aiSpend.hidden = !visible;
+  if (!visible) return;
+  const cost = Number(usage.cost_usd) || 0;
+  const cap = Number(usage.budget_usd) || 0;
+  aiSpendValue.textContent = cap > 0 ? `$${cost.toFixed(3)} / $${cap.toFixed(2)}` : `$${cost.toFixed(3)}`;
+  aiSpendFill.style.width = `${Math.min(100, Number(usage.budget_used_pct) || 0)}%`;
+  aiSpend.classList.toggle("paused", Boolean(usage.paused));
+  if (usage.paused) {
+    const resume = usage.resume_in_sec ? ` Retrying in ${usage.resume_in_sec}s.` : "";
+    aiSpendNote.textContent = `${usage.paused_reason || "Paused."}${resume}`;
+  } else {
+    const tokens = (usage.input_tokens || 0) + (usage.output_tokens || 0) + (usage.thinking_tokens || 0);
+    const skipped = usage.skipped ? ` · ${usage.skipped} avoided by change gating` : "";
+    aiSpendNote.textContent =
+      `${usage.calls || 0} call${usage.calls === 1 ? "" : "s"} · ${formatTokens(tokens)} tokens${skipped}`;
   }
 }
 
@@ -1464,13 +1826,7 @@ async function pushConfig(partial) {
     if (partial.show_expressions != null && !isLive) {
       renderExpressions({
         enabled: config.show_expressions,
-        state: config.show_expressions ? "idle" : "disabled",
-        events: [],
-        micro_cues: [],
-        structure_notes: config.show_expressions
-          ? "Expressions will activate when vision is live."
-          : "",
-        error: null,
+        state: config.show_expressions ? "idle" : "off",
       });
     }
     if (isLive) {
@@ -1489,6 +1845,8 @@ async function refreshStatus() {
     const data = await res.json();
     renderAnalysis(data.gemini);
     renderExpressions(data.expressions);
+    renderInsights(data.insights);
+    renderAiUsage(data.ai_usage, Boolean(data.gemini?.enabled));
 
     if (data.state === "idle" && !isLive) {
       analysisPanel.hidden = true;
@@ -1520,7 +1878,7 @@ async function refreshStatus() {
       setError(null);
       updateStats(data);
       updateDegraded(data.degraded);
-      updatePipelineRail(data.config, data.gemini, data.expressions);
+      updatePipelineRail(data.config, data.gemini, data.expressions, data.insights);
       ingestIntelFeed(data);
       handleAlerts(data.alerts);
       if (data.recording !== isRecording) setRecordingUI(data.recording);
@@ -1606,7 +1964,7 @@ async function startVision() {
     const res = await fetch("/api/start", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source }),
+      body: JSON.stringify({ source, profile: selectedProfile }),
     });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -1723,6 +2081,17 @@ btnRetry.addEventListener("click", retryVision);
 btnDownloadRaw.addEventListener("click", downloadRawSessionLog);
 btnDownloadEnriched.addEventListener("click", downloadEnrichedSessionLog);
 btnDismissLog.addEventListener("click", hideSessionLogActions);
+if (btnExportAnalysis) {
+  btnExportAnalysis.addEventListener("click", exportAnalysisTimeline);
+}
+
+if (profileOptions) {
+  profileOptions.addEventListener("click", (e) => {
+    const chip = e.target.closest(".profile-chip");
+    if (!chip || isLive) return;
+    selectProfile(chip.dataset.profile);
+  });
+}
 
 if (layerToggles) {
   layerToggles.addEventListener("click", (e) => {
@@ -1815,6 +2184,10 @@ async function hydrateFromServer() {
       youtubeCacheDir = health.youtube_cache_dir;
       updateSourceCacheHint();
     }
+    setProfileChoices(health.profiles, health.default_profile);
+    if (health.report_steps?.length) {
+      reportSteps = health.report_steps;
+    }
 
     syncLayerChips(config);
     if (config.confidence != null) {
@@ -1865,7 +2238,61 @@ async function hydrateFromServer() {
   }
 }
 
+function profileLabel(key) {
+  const match = profileChoices.find((p) => p.key === key);
+  if (match) return match.label;
+  return key ? key.charAt(0).toUpperCase() + key.slice(1) : "General";
+}
+
+function renderProfileOptions() {
+  if (!profileOptions) return;
+  for (const chip of profileOptions.querySelectorAll(".profile-chip")) {
+    const on = chip.dataset.profile === selectedProfile;
+    chip.classList.toggle("active", on);
+    chip.setAttribute("aria-checked", String(on));
+  }
+  const profile = profileChoices.find((p) => p.key === selectedProfile);
+  if (profileHint && profile?.description) profileHint.textContent = profile.description;
+}
+
+function setProfileChoices(list, defaultKey) {
+  if (!Array.isArray(list) || !list.length || !profileOptions) return;
+  profileChoices = list;
+  profileOptions.replaceChildren(
+    ...list.map((profile) => {
+      const chip = makeEl("button", "profile-chip", profile.label);
+      chip.type = "button";
+      chip.dataset.profile = profile.key;
+      chip.setAttribute("role", "radio");
+      chip.title = profile.description || "";
+      return chip;
+    })
+  );
+  if (!list.some((p) => p.key === selectedProfile)) {
+    selectedProfile = list.some((p) => p.key === defaultKey) ? defaultKey : list[0].key;
+  }
+  renderProfileOptions();
+}
+
+function selectProfile(key) {
+  if (!key) return;
+  selectedProfile = key;
+  try {
+    localStorage.setItem("yubi-profile", key);
+  } catch {
+    /* storage unavailable */
+  }
+  renderProfileOptions();
+}
+
 function restoreSavedSource() {
+  try {
+    const savedProfile = localStorage.getItem("yubi-profile");
+    if (savedProfile) selectedProfile = savedProfile;
+  } catch {
+    /* storage unavailable */
+  }
+  renderProfileOptions();
   if (!sourceInput) return;
   try {
     const saved = localStorage.getItem("yubi-source");

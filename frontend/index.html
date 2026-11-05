@@ -43,13 +43,23 @@
             <p class="source-hint">Leave blank for the server webcam</p>
             <p id="source-cache-hint" class="source-hint source-cache-hint" hidden></p>
           </div>
+          <div class="source-control profile-control">
+            <span class="source-label" id="profile-label">Analysis profile</span>
+            <div id="profile-options" class="profile-options" role="radiogroup" aria-labelledby="profile-label">
+              <button type="button" class="profile-chip active" data-profile="general" role="radio" aria-checked="true">General</button>
+              <button type="button" class="profile-chip" data-profile="interview" role="radio" aria-checked="false">Interview</button>
+              <button type="button" class="profile-chip" data-profile="security" role="radio" aria-checked="false">Security</button>
+            </div>
+            <p id="profile-hint" class="source-hint">Objects, skeleton, face, hands, and scene intelligence.</p>
+          </div>
           <p class="idle-hint">Initialize feed · <kbd>Space</kbd></p>
         </div>
         <div id="session-log-actions" class="session-log-actions intel-panel" hidden>
           <p class="session-log-title">Session complete</p>
           <p id="session-log-summary" class="session-log-summary"></p>
           <p class="session-log-hint">
-            Download a compact raw log now, or run YUBI v3.0 enrichment for an intelligence brief.
+            Download the measured log (with behavioral analysis), export the full episode
+            timeline, or run YUBI v3.0 for an evidence-checked intelligence brief.
           </p>
           <div class="session-log-buttons">
             <button id="btn-download-raw" type="button" class="btn btn-primary">
@@ -57,6 +67,9 @@
             </button>
             <button id="btn-download-enriched" type="button" class="btn btn-secondary">
               Enrich with YUBI v3.0
+            </button>
+            <button id="btn-export-analysis" type="button" class="btn btn-secondary">
+              Export timeline (JSON)
             </button>
             <button id="btn-dismiss-log" type="button" class="btn btn-secondary btn-ghost">
               Dismiss
@@ -70,9 +83,8 @@
           <p class="report-title">Preparing session report</p>
           <p id="report-status" class="report-status">Compiling session data…</p>
           <ol id="report-pass-list" class="report-pass-list">
-            <li id="report-pass-1" class="report-pass-item">Pass 1 — Structure</li>
-            <li id="report-pass-2" class="report-pass-item">Pass 2 — Analysis</li>
-            <li id="report-pass-3" class="report-pass-item">Pass 3 — Finalize</li>
+            <li class="report-pass-item">Analyzing behavioral evidence</li>
+            <li class="report-pass-item">Composing intelligence brief</li>
           </ol>
         </div>
       </div>
@@ -106,6 +118,14 @@
           <span class="telemetry-item">
             <span class="telemetry-k">UPTIME</span>
             <span id="telemetry-uptime" class="telemetry-v">00:00</span>
+          </span>
+          <span id="telemetry-media-item" class="telemetry-item" hidden>
+            <span class="telemetry-k">MEDIA</span>
+            <span id="telemetry-media" class="telemetry-v">00:00 / 00:00</span>
+          </span>
+          <span class="telemetry-item">
+            <span class="telemetry-k">MODE</span>
+            <span id="telemetry-profile" class="telemetry-v">GENERAL</span>
           </span>
         </div>
         <div id="pipeline-rail" class="pipeline-rail" hidden title="Click a layer to toggle overlays">
@@ -220,58 +240,98 @@
             <span class="panel-title">Micro-expression tracking</span>
             <span id="expression-state" class="panel-badge expression-badge">OFF</span>
           </div>
+          <div class="expression-scroll">
           <div class="expression-live-strip">
             <span id="expression-pulse" class="expression-pulse" aria-hidden="true"></span>
             <p id="expression-live-label" class="expression-live-label">Awaiting face lock</p>
+            <span id="expression-subjects" class="expression-subjects"></span>
+          </div>
+          <div class="expr-affect">
+            <div class="expr-affect-head">
+              <span class="expr-region-label">Affect</span>
+              <span id="expr-valence" class="expr-region-val">—</span>
+            </div>
+            <div id="expr-emotion-bars" class="expr-emotion-bars"></div>
+          </div>
+          <div class="expr-timeline-wrap">
+            <div class="expr-affect-head">
+              <span class="expr-region-label">Valence · activation · episodes</span>
+              <span id="expr-timeline-span" class="expr-region-val">—</span>
+            </div>
+            <canvas id="expr-timeline" class="expr-timeline" width="384" height="64" aria-hidden="true"></canvas>
           </div>
           <div class="expression-regions" aria-label="Region activity">
-            <div class="expr-region">
+            <div class="expr-region" data-region="brow">
               <div class="expr-region-head">
                 <span class="expr-region-label">Brow</span>
-                <span id="expr-region-brow-val" class="expr-region-val">—</span>
+                <span class="expr-region-val">—</span>
               </div>
-              <div class="expr-region-bar">
-                <div id="expr-bar-brow" class="expr-region-fill"></div>
-              </div>
+              <div class="expr-region-bar"><div class="expr-region-fill"></div></div>
             </div>
-            <div class="expr-region">
+            <div class="expr-region" data-region="eyes">
               <div class="expr-region-head">
-                <span class="expr-region-label">Under-eye</span>
-                <span id="expr-region-eye-val" class="expr-region-val">—</span>
+                <span class="expr-region-label">Eyes</span>
+                <span class="expr-region-val">—</span>
               </div>
-              <div class="expr-region-bar">
-                <div id="expr-bar-eye" class="expr-region-fill"></div>
-              </div>
+              <div class="expr-region-bar"><div class="expr-region-fill"></div></div>
             </div>
-            <div class="expr-region">
+            <div class="expr-region" data-region="nose">
               <div class="expr-region-head">
                 <span class="expr-region-label">Nose</span>
-                <span id="expr-region-nose-val" class="expr-region-val">—</span>
+                <span class="expr-region-val">—</span>
               </div>
-              <div class="expr-region-bar">
-                <div id="expr-bar-nose" class="expr-region-fill"></div>
-              </div>
+              <div class="expr-region-bar"><div class="expr-region-fill"></div></div>
             </div>
-            <div class="expr-region">
+            <div class="expr-region" data-region="mouth">
               <div class="expr-region-head">
                 <span class="expr-region-label">Mouth</span>
-                <span id="expr-region-mouth-val" class="expr-region-val">—</span>
+                <span class="expr-region-val">—</span>
               </div>
-              <div class="expr-region-bar">
-                <div id="expr-bar-mouth" class="expr-region-fill"></div>
-              </div>
+              <div class="expr-region-bar"><div class="expr-region-fill"></div></div>
             </div>
           </div>
+          <div class="expr-vitals" aria-label="Physiological and behavioral signals">
+            <div class="expr-vital" data-vital="blink">
+              <span class="expr-vital-k">Blink</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+            <div class="expr-vital" data-vital="gaze">
+              <span class="expr-vital-k">Gaze</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+            <div class="expr-vital" data-vital="head">
+              <span class="expr-vital-k">Head</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+            <div class="expr-vital" data-vital="pulse" title="Experimental camera pulse (rPPG) — needs steady light and an uncompressed feed">
+              <span class="expr-vital-k">Pulse (exp.)</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+            <div class="expr-vital" data-vital="speech">
+              <span class="expr-vital-k">Speech</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+            <div class="expr-vital" data-vital="touch">
+              <span class="expr-vital-k">Touch</span>
+              <span class="expr-vital-v">—</span>
+            </div>
+          </div>
+          <div class="expression-feed-header">
+            <span class="panel-title">Action units</span>
+            <span id="expression-au-count" class="panel-badge">0</span>
+          </div>
+          <div id="expr-au-chips" class="expr-au-chips"></div>
           <p id="expression-notes" class="expression-notes">
-            High-precision facial mesh for micro-movement detection.
+            FACS action units measured against each subject's own baseline.
           </p>
           <div class="expression-feed-header">
-            <span class="panel-title">Live signals</span>
+            <span class="panel-title">Episodes</span>
             <span id="expression-signal-count" class="panel-badge">0</span>
           </div>
           <ul id="expression-list" class="expression-list"></ul>
-          <p id="expression-empty" class="detections-empty">No micro-signals</p>
+          <p id="expression-empty" class="detections-empty">No episodes yet</p>
           <p id="expression-error" class="analysis-error" hidden></p>
+          </div>
         </aside>
 
         <aside id="analysis-panel" class="intel-panel analysis-panel" hidden>
@@ -279,9 +339,25 @@
             <span class="panel-title">YUBI v3.0</span>
             <span id="analysis-state" class="panel-badge analysis-badge">OFF</span>
           </div>
+          <div id="ai-spend" class="ai-spend" hidden>
+            <div class="ai-spend-row">
+              <span class="ai-spend-k">Session spend</span>
+              <span id="ai-spend-value" class="ai-spend-v">$0.000</span>
+            </div>
+            <div class="ai-spend-bar"><div id="ai-spend-fill" class="ai-spend-fill"></div></div>
+            <p id="ai-spend-note" class="ai-spend-note"></p>
+          </div>
           <p id="analysis-summary" class="analysis-summary">
             Semantic scene analysis when vision is live.
           </p>
+          <section id="insight-section" class="insight-section" hidden>
+            <div class="expression-feed-header">
+              <span class="panel-title">Behavioral insights</span>
+              <span id="insight-state" class="panel-badge">IDLE</span>
+            </div>
+            <p id="insight-summary" class="insight-summary"></p>
+            <ul id="insight-list" class="insight-list"></ul>
+          </section>
           <ul id="analysis-list" class="analysis-list"></ul>
           <p id="analysis-empty" class="detections-empty" hidden>Awaiting inference…</p>
           <p id="analysis-error" class="analysis-error" hidden></p>
@@ -297,7 +373,7 @@
           <button id="btn-clean" class="btn btn-secondary btn-chrome" type="button" disabled title="Toggle all vision overlays off/on">Clean feed</button>
           <button id="btn-snapshot" class="btn btn-secondary" disabled>Capture</button>
           <button id="btn-record" class="btn btn-secondary" disabled>
-            <span class="rec-dot"></span>Record
+            <span class="rec-dot"></span><span id="btn-record-label">Record</span>
           </button>
         </div>
         <p class="shortcut-hint">

@@ -5,9 +5,9 @@ from backend.expression_vision import (
     EXPR_LIPS_INDICES,
     EXPR_MESH_CONNECTIONS,
     EXPR_NOSE_INDICES,
-    ExpressionGuidance,
-    refine_landmarks_with_guidance,
+    draw_expression_overlay,
 )
+from backend.micro_expressions import SubjectRender
 from mediapipe.tasks.python.vision.face_landmarker import (
     FaceLandmarksConnections as FLC,
 )
@@ -23,8 +23,29 @@ def test_mesh_includes_lips_and_nose_groups() -> None:
     assert len(EXPR_NOSE_INDICES) > 5
 
 
-def test_refine_landmarks_no_op_without_guidance() -> None:
-    points = np.array([[10.0, 10.0], [20.0, 20.0]], dtype=np.float32)
-    guidance = ExpressionGuidance()
-    refined = refine_landmarks_with_guidance(points, guidance, width=640, height=480)
-    assert np.allclose(refined, points)
+def _render(flash: str | None = None) -> SubjectRender:
+    rng = np.random.default_rng(3)
+    points = rng.uniform(120, 360, size=(478, 2)).astype(np.float32)
+    return SubjectRender(
+        subject="A",
+        points_px=points,
+        regions={"brow": 0.6, "eyes": 0.1, "nose": 0.0, "mouth": 0.3},
+        tag="A · JOY 64%",
+        flash=flash,
+        flash_strength=0.8 if flash else 0.0,
+        primary=True,
+    )
+
+
+def test_overlay_draws_mesh_tag_and_flash() -> None:
+    scene = np.zeros((480, 640, 3), dtype=np.uint8)
+    plain = draw_expression_overlay(scene.copy(), [_render()])
+    flashed = draw_expression_overlay(scene.copy(), [_render("MICRO · Disgust")])
+    assert plain.any()
+    assert int(np.abs(flashed.astype(int) - plain.astype(int)).sum()) > 0
+
+
+def test_overlay_no_renders_is_noop() -> None:
+    scene = np.full((120, 160, 3), 7, dtype=np.uint8)
+    out = draw_expression_overlay(scene.copy(), [])
+    assert np.array_equal(out, scene)

@@ -17,6 +17,9 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from google.genai import types
+
+from backend.ai_client import AIClient, AIUnavailable
 from backend.config import Settings
 
 PERSON_LABELS = ("person", "man", "woman", "player", "human", "people")
@@ -155,8 +158,9 @@ def apply_identity_labels(
 class IdentityEnricher:
     """Periodic identity resolution for tracked people."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, ai: AIClient) -> None:
         self._settings = settings
+        self._ai = ai
         self._lock = threading.Lock()
         self._running = False
         self._in_flight = False
@@ -168,11 +172,7 @@ class IdentityEnricher:
 
     @property
     def enabled(self) -> bool:
-        return (
-            bool(self._settings.gemini_api_key)
-            and self._settings.gemini_enabled
-            and self._settings.identity_enabled
-        )
+        return self._ai.available and self._settings.identity_enabled
 
     def start(self) -> None:
         if not self.enabled:
@@ -201,7 +201,15 @@ class IdentityEnricher:
         if time.time() - last_run < self._settings.identity_interval_sec:
             return False
         fresh = self.cache.fresh_ids()
-        return any(h["tracker_id"] not in fresh for h in hints)
+        if all(h["tracker_id"] in fresh for h in hints):
+            return False
+        blocked = self._ai.budget.blocked_reason("identity", self._ai.perception_model)
+        if blocked:
+            with self._lock:
+                self._error = blocked
+                self._last_run = time.time()
+            return False
+        return True
 
     def push_frame(self, jpeg_bytes: bytes, hints: list[dict[str, Any]]) -> None:
         if not self.enabled or not hints:
@@ -241,7 +249,7 @@ class IdentityEnricher:
                 self.cache.set(int(tid), identity, max(0.0, min(1.0, conf_f)))
             with self._lock:
                 self._error = None
-        except Exception as exc:
+        except AIUnavailable as exc:
             with self._lock:
                 self._error = str(exc)
         finally:
@@ -251,10 +259,6 @@ class IdentityEnricher:
     def _analyze(
         self, jpeg_bytes: bytes, hints: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self._settings.gemini_api_key)
         prompt = (
             "This frame contains tracked people, each given as a numbered region "
             "(box_2d is [ymin, xmin, ymax, xmax], normalized 0-1000). For every "
@@ -265,20 +269,22 @@ class IdentityEnricher:
             "Keep each identity under 24 characters. Echo back the tracker_id.\n"
             'Return JSON: {"identities": [{"tracker_id": int, "identity": str, '
             '"confidence": 0.0-1.0}]}\n\nRegions:\n'
-            + json.dumps(hints, indent=2)
+            + json.dumps(hints, separators=(",", ":"))
         )
 
-        response = client.models.generate_content(
-            model=self._settings.gemini_model,
+        result = self._ai.generate(
+            feature="identity",
+            model=self._ai.perception_model,
             contents=[
                 types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
                 prompt,
             ],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
-            ),
+            json_mode=True,
+            temperature=0.1,
+            thinking="minimal",
+            media_resolution=self._settings.gemini_media_resolution,
+            max_output_tokens=2048,
         )
-        payload = json.loads(response.text or "{}")
+        payload = result.data if isinstance(result.data, dict) else {}
         identities = payload.get("identities", [])
         return identities if isinstance(identities, list) else []

@@ -6,6 +6,11 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+import cv2
+import numpy as np
+from google.genai import types
+
+from backend.ai_client import AIClient, AIUnavailable
 from backend.config import Settings
 
 
@@ -453,67 +458,183 @@ def build_reconciled_detection_labels(
     return indices, labels
 
 
-class GeminiEnricher:
-    """Periodic v3.0 scene analysis — first frame ASAP, then on an interval."""
+_THUMB_SIZE = (32, 18)
 
-    def __init__(self, settings: Settings) -> None:
+
+def scene_thumbnail(frame_bgr: np.ndarray) -> np.ndarray:
+    """Tiny grayscale thumbnail — enough to tell a changed view from sensor noise."""
+    small = cv2.resize(frame_bgr, _THUMB_SIZE, interpolation=cv2.INTER_AREA)
+    return cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+
+def scene_signature(tracks: list[dict[str, Any]], min_confidence: float = 0.5) -> tuple[str, ...]:
+    """Confident object classes in view; a new class appearing counts as scene change."""
+    return tuple(
+        sorted(
+            {
+                str(t.get("label", "")).lower()
+                for t in tracks
+                if float(t.get("confidence") or 0.0) >= min_confidence
+            }
+        )
+    )
+
+
+class SceneChangeGate:
+    """Skip scene passes while the view is unchanged, backing off toward a max interval.
+
+    A changed thumbnail, a new confident object class, or unverified low-confidence
+    tracks trigger a pass (after the minimum interval). Otherwise the refresh
+    interval doubles up to the maximum, so a static room costs ~1 call a minute.
+    """
+
+    def __init__(self, min_interval: float, max_interval: float, threshold: float) -> None:
+        self._min = min_interval
+        self._max = max(max_interval, min_interval)
+        self._threshold = threshold
+        self.reset()
+
+    def reset(self) -> None:
+        self._thumb: np.ndarray | None = None
+        self._signature: tuple[str, ...] | None = None
+        self._interval = self._min
+        self._last_run = 0.0
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    def interval_elapsed(self, now: float) -> bool:
+        return self._thumb is None or now - self._last_run >= self._min
+
+    def decide(
+        self,
+        now: float,
+        thumb: np.ndarray,
+        signature: tuple[str, ...],
+        force: bool = False,
+    ) -> str | None:
+        """Return why a pass should run ("first" / "changed" / "refresh") or None."""
+        if self._thumb is None:
+            return "first"
+        if now - self._last_run < self._min:
+            return None
+        change = float(np.mean(np.abs(thumb.astype(np.int16) - self._thumb.astype(np.int16))))
+        if force or change >= self._threshold or signature != self._signature:
+            return "changed"
+        if now - self._last_run >= self._interval:
+            return "refresh"
+        return None
+
+    def commit(
+        self, now: float, thumb: np.ndarray, signature: tuple[str, ...], reason: str
+    ) -> None:
+        self._thumb = thumb
+        self._signature = signature
+        self._last_run = now
+        if reason == "refresh":
+            self._interval = min(self._interval * 2.0, self._max)
+        else:
+            self._interval = min(self._min * 2.0, self._max)
+
+
+SCENE_PROMPT = (
+    "Analyze this frame for a real-time vision system. Return JSON:\n"
+    '- "scene_summary": one sentence about the scene and activity\n'
+    '- "objects": array of visible items. Each item:\n'
+    '  - "label": short name matching common detection classes when possible '
+    "(person, chair, laptop, cell phone, cup, book, shelf, cabinet, etc.)\n"
+    '  - "confidence": 0.0-1.0\n'
+    '  - "box_2d": [ymin, xmin, ymax, xmax] normalized 0-1000\n'
+    "Tight boxes on visible object edges. ymin/xmin = top-left, ymax/xmax = bottom-right. "
+    "Only include objects you can clearly see — omit guesses and tiny clutter."
+)
+
+
+class GeminiEnricher:
+    """Change-gated v3.0 scene analysis — first frame ASAP, then only when the view changes."""
+
+    def __init__(self, settings: Settings, ai: AIClient) -> None:
         self._settings = settings
+        self._ai = ai
         self._lock = threading.Lock()
         self._running = False
         self._analysis_in_flight = False
-        self._latest_jpeg: bytes | None = None
-        self._uncertain_hints: list[dict[str, Any]] = []
+        self._next_check = 0.0
+        self._skip_mark = 0.0
+        self._gate = SceneChangeGate(
+            settings.gemini_interval_sec,
+            settings.gemini_max_interval_sec,
+            settings.gemini_scene_change_threshold,
+        )
         self._insight = GeminiInsight(
             state="disabled" if not self.enabled else "idle"
         )
 
     @property
     def enabled(self) -> bool:
-        return bool(self._settings.gemini_api_key) and self._settings.gemini_enabled
+        return self._ai.available
+
+    @property
+    def refresh_interval(self) -> float:
+        return self._gate.interval
+
+    def ready(self) -> bool:
+        """Cheap per-frame check: may a scene pass be considered right now?"""
+        if not self.enabled:
+            return False
+        now = time.time()
+        with self._lock:
+            if not self._running or self._analysis_in_flight or now < self._next_check:
+                return False
+            return self._gate.interval_elapsed(now)
+
+    def consider(
+        self,
+        thumb: np.ndarray,
+        signature: tuple[str, ...],
+        force: bool = False,
+    ) -> str | None:
+        """Gate decision for the current frame; records avoided calls in the budget."""
+        now = time.time()
+        with self._lock:
+            reason = self._gate.decide(now, thumb, signature, force)
+            if reason is None:
+                self._next_check = now + 0.5
+                if now - self._skip_mark >= self._settings.gemini_interval_sec:
+                    self._skip_mark = now
+                    self._ai.budget.record_skip("scene")
+                return None
+            blocked = self._ai.budget.blocked_reason("scene", self._ai.perception_model)
+            if blocked:
+                self._next_check = now + 5.0
+                self._insight = GeminiInsight(
+                    state="paused",
+                    scene_summary=self._insight.scene_summary,
+                    objects=self._insight.objects,
+                    error=blocked,
+                    updated_at=self._insight.updated_at,
+                )
+                return None
+            self._gate.commit(now, thumb, signature, reason)
+            self._skip_mark = now
+            return reason
 
     def push_frame(
         self, jpeg_bytes: bytes, uncertain: list[dict[str, Any]] | None = None
     ) -> None:
-        """Store latest clean frame; trigger analysis on first frame or interval."""
-        if not self.enabled:
+        """Run a pass on a frame the gate approved (see ``consider``)."""
+        if not self.enabled or not jpeg_bytes:
             return
         with self._lock:
-            if not self._running:
+            if not self._running or self._analysis_in_flight:
                 return
-            self._latest_jpeg = jpeg_bytes
-            if uncertain:
-                self._uncertain_hints = uncertain
-            insight = self._insight
-            in_flight = self._analysis_in_flight
-        if in_flight:
-            return
-
-        now = time.time()
-        is_first = insight.updated_at is None
-        interval_ok = (
-            insight.updated_at is not None
-            and now - insight.updated_at >= self._settings.gemini_interval_sec
-        )
-        if is_first or interval_ok:
-            self._schedule_analysis()
-
-    def wants_new_analysis(self) -> bool:
-        """True when a new v3.0 scene pass should run (skip per-frame JPEG encode otherwise)."""
-        if not self.enabled:
-            return False
-        with self._lock:
-            if not self._running:
-                return False
-            if self._analysis_in_flight:
-                return False
-            insight = self._insight
-        now = time.time()
-        is_first = insight.updated_at is None
-        interval_ok = (
-            insight.updated_at is not None
-            and now - insight.updated_at >= self._settings.gemini_interval_sec
-        )
-        return is_first or interval_ok
+            self._analysis_in_flight = True
+        threading.Thread(
+            target=self._run_analysis,
+            args=(jpeg_bytes, list(uncertain or [])),
+            daemon=True,
+        ).start()
 
     def start(self) -> None:
         if not self.enabled:
@@ -522,12 +643,14 @@ class GeminiEnricher:
             if self._running:
                 return
             self._running = True
+            self._next_check = 0.0
+            self._skip_mark = time.time()
+            self._gate.reset()
             self._insight = GeminiInsight(state="idle")
 
     def stop(self) -> None:
         with self._lock:
             self._running = False
-            self._latest_jpeg = None
             if not self.enabled:
                 self._insight = GeminiInsight(state="disabled")
             else:
@@ -561,25 +684,8 @@ class GeminiEnricher:
                 updated_at=kwargs.get("updated_at", self._insight.updated_at),
             )
 
-    def _schedule_analysis(self) -> None:
-        with self._lock:
-            if not self._running or not self._latest_jpeg or self._analysis_in_flight:
-                return
-            frame = self._latest_jpeg
-            self._analysis_in_flight = True
-
-        threading.Thread(
-            target=self._run_analysis,
-            args=(frame,),
-            daemon=True,
-        ).start()
-
-    def _run_analysis(self, jpeg_bytes: bytes) -> None:
-        hints: list[dict[str, Any]] = []
+    def _run_analysis(self, jpeg_bytes: bytes, hints: list[dict[str, Any]]) -> None:
         try:
-            with self._lock:
-                hints = list(self._uncertain_hints)
-                self._uncertain_hints = []
             insight = self._analyze(jpeg_bytes, hints)
             self._set_insight(
                 state="ready",
@@ -588,51 +694,37 @@ class GeminiEnricher:
                 error=None,
                 updated_at=time.time(),
             )
-        except Exception as exc:
-            self._set_insight(state="error", error=str(exc))
+        except AIUnavailable as exc:
+            self._set_insight(state="paused", error=str(exc))
         finally:
-            self._analysis_in_flight = False
+            with self._lock:
+                self._analysis_in_flight = False
 
     def _analyze(
         self, jpeg_bytes: bytes, uncertain_hints: list[dict[str, Any]] | None = None
     ) -> GeminiInsight:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self._settings.gemini_api_key)
-        prompt = (
-            "Analyze this live webcam frame for a real-time vision system. Return JSON:\n"
-            '- "scene_summary": one sentence about the scene and activity\n'
-            '- "objects": array of visible items. Each item:\n'
-            '  - "label": short name matching common detection classes when possible '
-            '(person, chair, laptop, cell phone, cup, book, shelf, cabinet, etc.)\n'
-            '  - "confidence": 0.0-1.0\n'
-            '  - "box_2d": [ymin, xmin, ymax, xmax] normalized 0-1000\n'
-            "Tight boxes on visible object edges. ymin/xmin = top-left, ymax/xmax = bottom-right. "
-            "Only include objects you can clearly see — omit guesses and tiny clutter. "
-            f"Limit to {self._settings.gemini_max_objects} objects."
-        )
+        prompt = SCENE_PROMPT + f" Limit to {self._settings.gemini_max_objects} objects."
         if uncertain_hints:
             prompt += (
                 "\n\nThe local detector flagged these LOW-CONFIDENCE regions for verification. "
                 "For each, confirm the label, correct it, or omit if not a real object:\n"
-                + json.dumps(uncertain_hints, indent=2)
+                + json.dumps(uncertain_hints, separators=(",", ":"))
             )
 
-        response = client.models.generate_content(
-            model=self._settings.gemini_model,
+        result = self._ai.generate(
+            feature="scene",
+            model=self._ai.perception_model,
             contents=[
                 types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
                 prompt,
             ],
-            config=types.GenerateContentConfig(
-                temperature=0.1,
-                response_mime_type="application/json",
-            ),
+            json_mode=True,
+            temperature=0.1,
+            thinking="minimal",
+            media_resolution=self._settings.gemini_media_resolution,
+            max_output_tokens=2048,
         )
-
-        raw = response.text or "{}"
-        payload = json.loads(raw)
+        payload = result.data if isinstance(result.data, dict) else {}
         objects: list[GeminiObject] = []
         for item in payload.get("objects", []):
             box = item.get("box_2d") or item.get("bounding_box")
