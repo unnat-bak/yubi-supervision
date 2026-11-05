@@ -6,10 +6,11 @@ import threading
 from contextlib import asynccontextmanager
 
 from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, PlainTextResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import get_settings
+from backend.profiles import PROFILES
 from backend.schemas import (
     ConfigUpdate,
     GeminiStatusResponse,
@@ -20,7 +21,12 @@ from backend.schemas import (
     StartResponse,
     StatusResponse,
 )
-from backend.session_report import enrich_session_report_events
+from backend.session_report import (
+    PASS_LABELS,
+    enrich_session_report_events,
+    pass_plan,
+    render_analysis_markdown,
+)
 from backend.sources import get_youtube_cache_dir, prune_youtube_cache
 from backend.vision import VisionEngine
 
@@ -52,6 +58,9 @@ async def health() -> HealthResponse:
         app=settings.app_name,
         vision_state=stats.state,
         youtube_cache_dir=str(cache_dir),
+        profiles=[profile.as_dict() for profile in PROFILES.values()],
+        default_profile=settings.default_profile,
+        report_steps=[PASS_LABELS[step] for step in pass_plan(settings.session_report_passes)],
     )
 
 
@@ -76,8 +85,8 @@ async def start_vision(
     if engine.is_starting:
         return StartResponse(state="starting", source_label=engine.source_label)
     source = (payload.source or "").strip() or None
-    engine.start_async(source)
-    return StartResponse(state="starting")
+    engine.start_async(source, payload.profile)
+    return StartResponse(state="starting", profile=engine.get_stats().profile)
 
 
 @app.post("/api/stop", response_model=StartResponse)
@@ -138,6 +147,8 @@ async def status() -> StatusResponse:
             "updated_at": insight.updated_at,
         },
         expressions=engine.get_expression_status(),
+        insights=engine.get_intelligence_status(),
+        ai_usage=engine.get_ai_usage(),
         error=stats.error,
         session_id=stats.session_id,
         frame_index=stats.frame_index,
@@ -147,7 +158,35 @@ async def status() -> StatusResponse:
         source_is_live=stats.source_is_live,
         stream_frame_seq=stats.stream_frame_seq,
         stream_fps=stats.stream_fps,
+        profile=stats.profile,
+        media_position_sec=stats.media_position_sec,
+        media_duration_sec=stats.media_duration_sec,
+        processing_speed=stats.processing_speed,
     )
+
+
+@app.get("/api/analysis")
+async def analysis() -> dict:
+    return await asyncio.to_thread(engine.get_analysis)
+
+
+@app.get("/api/analysis/export")
+async def analysis_export() -> Response:
+    data = await asyncio.to_thread(engine.get_analysis)
+    session_id = (data.get("session") or {}).get("session_id") or "session"
+    return Response(
+        content=json.dumps(data, ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="yubi-analysis-{session_id}.json"'
+        },
+    )
+
+
+@app.get("/api/analysis/report.md", response_class=PlainTextResponse)
+async def analysis_markdown() -> PlainTextResponse:
+    data = await asyncio.to_thread(engine.get_analysis)
+    return PlainTextResponse(render_analysis_markdown(data), media_type="text/markdown")
 
 
 @app.get("/api/snapshot")
@@ -185,22 +224,23 @@ async def record_stop() -> dict:
     return {"recording": False}
 
 
+def _report_events(payload: SessionReportRequest):
+    return enrich_session_report_events(
+        payload.draft_markdown,
+        payload.session,
+        settings,
+        ai=engine.ai,
+        analysis=engine.get_analysis(),
+    )
+
+
 @app.post("/api/session-report", response_model=SessionReportResponse)
 async def session_report(payload: SessionReportRequest) -> SessionReportResponse:
-    if not settings.gemini_active:
-        return SessionReportResponse(
-            markdown=payload.draft_markdown,
-            passes_completed=0,
-            enriched=False,
-        )
-
     def run() -> SessionReportResponse:
         result_markdown = payload.draft_markdown
         passes_completed = 0
         enriched = False
-        for event in enrich_session_report_events(
-            payload.draft_markdown, payload.session, settings
-        ):
+        for event in _report_events(payload):
             if event.get("phase") == "done":
                 result_markdown = str(event.get("markdown", result_markdown))
                 passes_completed = int(event.get("passes_completed", 0))
@@ -220,9 +260,7 @@ async def session_report_stream(payload: SessionReportRequest):
 
     def worker() -> None:
         try:
-            for event in enrich_session_report_events(
-                payload.draft_markdown, payload.session, settings
-            ):
+            for event in _report_events(payload):
                 loop.call_soon_threadsafe(queue.put_nowait, event)
         except Exception as exc:
             loop.call_soon_threadsafe(

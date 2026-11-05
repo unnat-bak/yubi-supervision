@@ -23,6 +23,11 @@ Use **`/model fable`** (Claude Fable 5) for multi-file vision pipeline work, deb
 - **YUBI v3.0** uses `GEMINI_*` env vars and `/api/gemini` internally; UI/export say **YUBI v3.0** only.
 - **Layer toggles** are in the **left sidebar** (`#layer-toggles` inside detections panel).
 - **Session report** uses `POST /api/session-report/stream` (NDJSON); worker thread in `main.py`.
+- **All AI calls** go through `AIClient.generate` (`backend/ai_client.py`) so `AIBudget` can cap spend and pause on depleted credits — never call the GenAI SDK directly. Catch `AIUnavailable`.
+- **Expressions** come from `backend/micro_expressions.py` (FACS engine) — overlay only draws in `expression_vision.py`. Brow movements during speech are `speech_emphasis`, not emotions; an episode's emotion must involve its own AUs.
+- **Interview profile** plays files once and stops at EOF; other profiles loop files.
+- **Overlay text is ASCII-only** (OpenCV Hershey fonts) — `·` / `—` render as `??`; use ` | ` and `-`.
+- **Editing backend `.py` reloads uvicorn** and ends any live session — finish live smoke tests before backend edits.
 - Models download on first run: MediaPipe `.task` → `backend/models/`; YOLO → `yolov8s.pt` in project root.
 
 ## Where to add code
@@ -33,7 +38,11 @@ Use **`/model fable`** (Claude Fable 5) for multi-file vision pipeline work, deb
 | Env / defaults | `backend/config.py` + `.env.example` |
 | Capture / YOLO / loop | `backend/vision.py` |
 | YUBI v3.0 scene / reconcile | `backend/gemini_vision.py` |
-| Expression / micro-signals | `backend/expression_vision.py` |
+| Expression engine (AUs, episodes, cues) | `backend/facs.py`, `backend/micro_expressions.py` |
+| Expression overlay | `backend/expression_vision.py` |
+| Behavioral insights | `backend/insight_engine.py` |
+| AI spend / caps | `backend/ai_budget.py`, `backend/ai_client.py` |
+| Analysis profiles | `backend/profiles.py` |
 | Session report passes | `backend/session_report.py` |
 | UI / polling / session log | `frontend/app.js`, `styles.css`, `index.html` |
 | Agent context | `AGENTS.md` (canonical), this file for Claude-only notes |

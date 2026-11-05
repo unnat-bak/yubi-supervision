@@ -221,6 +221,19 @@ class OpenCvReader:
         """Mark ended; ``VideoCapture.release`` must run on the capture thread."""
         self._ended = True
 
+    def media_info(self) -> tuple[float, int]:
+        """(fps, frame_count) reported by the container; zeros when unknown."""
+        if self._released or self._cap is None:
+            return 0.0, 0
+        try:
+            fps = float(self._cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            count = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        except Exception:
+            return 0.0, 0
+        if not (0.0 < fps <= 240.0):
+            fps = 0.0
+        return fps, max(0, count)
+
     def seek_to_start(self) -> bool:
         """Rewind a seekable capture (file / downloaded clip) for looping."""
         if self._released or self._cap is None:

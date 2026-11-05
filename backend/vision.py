@@ -19,13 +19,10 @@ import numpy as np
 import supervision as sv
 from ultralytics import YOLO
 
+from backend.ai_budget import AIBudget
+from backend.ai_client import AIClient
 from backend.config import Settings, get_settings
-from backend.expression_vision import (
-    ExpressionEnricher,
-    MicroExpressionTracker,
-    crop_face_jpeg,
-    draw_expression_overlay,
-)
+from backend.expression_vision import draw_expression_overlay
 from backend.gemini_vision import (
     GeminiEnricher,
     GeminiInsight,
@@ -37,12 +34,15 @@ from backend.gemini_vision import (
     merge_insight_into_tracks,
     normalize_box_2d,
     reconcile_tracked_objects,
+    scene_signature,
+    scene_thumbnail,
 )
 from backend.identity_vision import (
     IdentityEnricher,
     apply_identity_labels,
     collect_person_hints,
 )
+from backend.insight_engine import InsightEngine
 from backend.live_capture import (
     FfmpegPipeReader,
     LatestFrameSlot,
@@ -50,6 +50,8 @@ from backend.live_capture import (
     ffmpeg_available,
     open_ffmpeg_pipe,
 )
+from backend.micro_expressions import ExpressionAnalyzer, ExpressionFrame
+from backend.profiles import AnalysisProfile, resolve_profile
 from backend.sources import (
     ResolvedSource,
     classify_source,
@@ -115,6 +117,14 @@ def _enable_ffmpeg_low_latency() -> None:
     os.environ[key] = "fflags;nobuffer|flags;low_delay|max_delay;500000"
 
 
+@dataclass(frozen=True)
+class FrameMeta:
+    """Decode position of a captured frame: index within the clip and loop count."""
+
+    index: int
+    loop: int
+
+
 class _CaptureWorker:
     """Dedicated capture thread — publishes into a ``LatestFrameSlot``."""
 
@@ -130,10 +140,12 @@ class _CaptureWorker:
         self._slot = slot
         self._drop = drop_frames
         self._loop_on_eof = loop_on_eof
-        self._queue: queue.Queue[np.ndarray] = queue.Queue(maxsize=1)
+        self._queue: queue.Queue[tuple[np.ndarray, FrameMeta]] = queue.Queue(maxsize=1)
         self._running = False
         self._ended = False
         self._thread: threading.Thread | None = None
+        self._frame_index = 0
+        self._loop_count = 0
 
     @property
     def ended(self) -> bool:
@@ -168,6 +180,8 @@ class _CaptureWorker:
                 if not ok or frame is None:
                     if self._loop_on_eof and isinstance(self._reader, OpenCvReader):
                         if self._reader.seek_to_start():
+                            self._frame_index = 0
+                            self._loop_count += 1
                             time.sleep(0.005)
                             continue
                     self._ended = True
@@ -175,17 +189,19 @@ class _CaptureWorker:
                     continue
                 self._ended = False
                 self._slot.publish(frame)
+                item = (frame, FrameMeta(index=self._frame_index, loop=self._loop_count))
+                self._frame_index += 1
                 if self._drop:
                     if self._queue.full():
                         try:
                             self._queue.get_nowait()
                         except queue.Empty:
                             pass
-                    self._queue.put(frame)
+                    self._queue.put(item)
                 else:
                     while self._running:
                         try:
-                            self._queue.put(frame, timeout=0.1)
+                            self._queue.put(item, timeout=0.1)
                             break
                         except queue.Full:
                             continue
@@ -199,11 +215,18 @@ class _CaptureWorker:
     def snapshot_frame(self) -> tuple[int, np.ndarray | None]:
         return self._slot.snapshot()
 
-    def read_latest(self, timeout: float = 0.05) -> tuple[bool, np.ndarray | None]:
+    def read_frame(
+        self, timeout: float = 0.05
+    ) -> tuple[bool, np.ndarray | None, FrameMeta | None]:
         try:
-            return True, self._queue.get(timeout=timeout)
+            frame, meta = self._queue.get(timeout=timeout)
         except queue.Empty:
-            return False, None
+            return False, None, None
+        return True, frame, meta
+
+    def read_latest(self, timeout: float = 0.05) -> tuple[bool, np.ndarray | None]:
+        ok, frame, _ = self.read_frame(timeout)
+        return ok, frame
 
 
 def ensure_models(models_dir: Path, timeout_sec: float = 60.0) -> None:
@@ -236,6 +259,15 @@ def keypoints_from_hands(result, resolution_wh: tuple[int, int]) -> sv.KeyPoints
         xy=np.array(xy, dtype=np.float32),
         confidence=np.array(confidence, dtype=np.float32),
     )
+
+
+def normalized_hand_points(result) -> list[np.ndarray]:
+    if result is None or not result.hand_landmarks:
+        return []
+    return [
+        np.array([[lm.x, lm.y] for lm in hand], dtype=np.float32)
+        for hand in result.hand_landmarks
+    ]
 
 
 def summarize_objects(
@@ -499,6 +531,55 @@ class VisionStats:
     source_is_live: bool = False
     stream_frame_seq: int = 0
     stream_fps: float = 0.0
+    profile: str = "general"
+    media_position_sec: float = 0.0
+    media_duration_sec: float = 0.0
+    processing_speed: float = 0.0
+
+
+class _PlaybackClock:
+    """Media-time bookkeeping and 1x pacing for file sources."""
+
+    def __init__(self, fps: float, duration_sec: float, pace: bool) -> None:
+        self.fps = fps if fps > 0 else 30.0
+        self.duration_sec = duration_sec
+        self.pace = pace
+        self._loop = 0
+        self._loop_offset = 0.0
+        self._last_media = 0.0
+        self._anchor_wall: float | None = None
+        self._anchor_t = 0.0
+        self._speed_wall: float | None = None
+        self._speed_t = 0.0
+        self.speed = 0.0
+
+    def stamp(self, meta: FrameMeta) -> tuple[float, float]:
+        """(monotonic analysis time, position within the clip) for a decoded frame."""
+        media_sec = meta.index / self.fps
+        if meta.loop != self._loop:
+            clip_length = self.duration_sec or (self._last_media + 1.0 / self.fps)
+            self._loop_offset += clip_length * (meta.loop - self._loop)
+            self._loop = meta.loop
+            self._anchor_wall = None
+        self._last_media = media_sec
+        return self._loop_offset + media_sec, media_sec
+
+    def pace_and_measure(self, t: float) -> None:
+        now = time.perf_counter()
+        if self._speed_wall is not None and now > self._speed_wall:
+            instant = (t - self._speed_t) / (now - self._speed_wall)
+            self.speed = round(0.9 * self.speed + 0.1 * instant, 2) if self.speed else instant
+        self._speed_wall, self._speed_t = now, t
+        if not self.pace:
+            return
+        if self._anchor_wall is None:
+            self._anchor_wall, self._anchor_t = now, t
+            return
+        delay = self._anchor_wall + (t - self._anchor_t) - now
+        if delay > 0:
+            time.sleep(min(delay, 0.25))
+        elif delay < -0.5:
+            self._anchor_wall, self._anchor_t = now, t
 
 
 class VisionEngine:
@@ -521,10 +602,23 @@ class VisionEngine:
             show_pose_labels=self._settings.show_pose_labels_default,
             show_identity=self._settings.show_identity_default,
         )
-        self._gemini = GeminiEnricher(self._settings)
-        self._expression = ExpressionEnricher(self._settings)
-        self._identity = IdentityEnricher(self._settings)
-        self._micro_tracker = MicroExpressionTracker()
+        self._ai_budget = AIBudget(self._settings)
+        self.ai = AIClient(self._settings, self._ai_budget)
+        self._gemini = GeminiEnricher(self._settings, self.ai)
+        self._identity = IdentityEnricher(self._settings, self.ai)
+        self._expressions = ExpressionAnalyzer(self._settings)
+        self._insights = InsightEngine(self._settings, self.ai, self._expressions.summary)
+        self._profile: AnalysisProfile = resolve_profile(None, self._settings.default_profile)
+        self._loop_files = self._settings.source_loop
+        self._media_fps = 0.0
+        self._media_duration = 0.0
+        self._media_position = 0.0
+        self._processing_speed = 0.0
+        self._session_started_at: float | None = None
+        self._session_ended_at: float | None = None
+        self._last_source_label = ""
+        self._last_source_kind = ""
+        self._verify_requested: set[int] = set()
         self._track_labels = TrackLabelCache(self._settings.gemini_label_cache_sec)
         self._source_request: str | None = None
         self._source_label = ""
@@ -667,39 +761,56 @@ class VisionEngine:
         return self._gemini.get_insight()
 
     def get_expression_status(self) -> dict[str, object]:
+        return self._expressions.status()
+
+    def get_intelligence_status(self) -> dict[str, object]:
+        status = self._insights.status()
+        status["scene_refresh_sec"] = round(self._gemini.refresh_interval, 1)
+        return status
+
+    def get_ai_usage(self) -> dict[str, object]:
+        return self._ai_budget.snapshot()
+
+    def get_analysis(self) -> dict[str, object]:
+        """Full session analysis — retained after Terminate until the next start."""
+        insight = self._gemini.get_insight()
         with self._lock:
-            enabled = self._config.show_expressions
-        guidance = self._expression.get_guidance()
-        events = self._micro_tracker.get_active_events()
+            started = self._session_started_at
+            ended = self._session_ended_at
+            meta = {
+                "session_id": self._session_id,
+                "profile": self._profile.as_dict(),
+                "source_label": self._source_label or self._last_source_label,
+                "source_kind": self._source_kind or self._last_source_kind,
+                "media_duration_sec": round(self._media_duration, 1),
+                "started_at": started,
+                "ended_at": ended,
+                "duration_sec": round(((ended or time.time()) - started), 1) if started else 0.0,
+            }
+        insights = self._insights.all_insights()
         return {
-            "enabled": enabled,
-            "state": guidance.state,
-            "events": [
-                {
-                    "label": e.label,
-                    "region": e.region,
-                    "intensity": e.intensity,
-                    "ts": e.ts,
-                }
-                for e in events
-            ],
-            "micro_cues": guidance.micro_cues,
-            "structure_notes": guidance.structure_notes,
-            "error": guidance.error,
-            "updated_at": guidance.updated_at,
+            "session": meta,
+            "expressions": self._expressions.analysis(),
+            "insights": insights["insights"],
+            "running_summary": insights["running_summary"],
+            "scene_summary": insight.scene_summary,
+            "ai_usage": self._ai_budget.snapshot(),
         }
 
     def gemini_enabled(self) -> bool:
         return self._gemini.enabled
+
+    def _sync_expression_layers(self) -> None:
+        enabled = self._config.show_expressions
+        self._expressions.set_enabled(enabled)
+        self._insights.set_active(enabled and self._profile.insights)
 
     def update_config(self, **kwargs: object) -> VisionConfig:
         with self._lock:
             for key, value in kwargs.items():
                 if hasattr(self._config, key) and value is not None:
                     setattr(self._config, key, value)
-            self._expression.set_active(self._config.show_expressions)
-            if not self._config.show_expressions:
-                self._micro_tracker.reset()
+            self._sync_expression_layers()
             if not self._config.show_identity:
                 self._identity.cache.reset()
             return self._clone_config(self._config)
@@ -732,6 +843,10 @@ class VisionEngine:
                 source_is_live=self._source_is_live,
                 stream_frame_seq=self._stream_frame_seq,
                 stream_fps=self._stream_fps,
+                profile=self._profile.key,
+                media_position_sec=round(self._media_position, 2),
+                media_duration_sec=round(self._media_duration, 2),
+                processing_speed=self._processing_speed,
             )
 
     def get_snapshot(self) -> tuple[bytes, dict] | None:
@@ -820,7 +935,7 @@ class VisionEngine:
             self._stats = VisionStats(state="starting", startup_message=message)
 
     def _apply_live_remote_lite(self) -> None:
-        if not self._settings.live_remote_lite:
+        if not self._settings.live_remote_lite or not self._profile.remote_live_lite:
             return
         self._config.show_pose = False
         self._config.show_face = False
@@ -836,9 +951,11 @@ class VisionEngine:
         self._stop_live_preview()
         self._gemini.stop()
         self._identity.stop()
-        self._expression.set_active(False)
+        self._insights.stop()
+        self._expressions.set_enabled(False)
         self._stop_capture_worker()
         with self._lock:
+            self._session_ended_at = time.time()
             degraded = list(self._stats.degraded)
             self._release_models(None, self._pose, self._face, self._hand)
             self._frame_reader = None
@@ -857,7 +974,7 @@ class VisionEngine:
         self._stop_live_preview()
         self._gemini.stop()
         self._identity.stop()
-        self._expression.set_active(False)
+        self._insights.stop()
         self._stop_capture_worker()
         with self._lock:
             if self._thread and not self._thread.is_alive():
@@ -1132,15 +1249,24 @@ class VisionEngine:
         self._tune_capture(cap)
         return OpenCvReader(cap)
 
-    def start_async(self, source: str | None = None) -> None:
+    def start_async(self, source: str | None = None, profile: str | None = None) -> None:
         with self._lock:
             if self._running or self._starting:
                 return
             self._starting = True
             self._source_request = source
+            self._profile = resolve_profile(profile, self._settings.default_profile)
+            for key, value in self._profile.layers.items():
+                setattr(self._config, key, value)
+            self._loop_files = (
+                self._settings.source_loop
+                if self._profile.loop_files is None
+                else self._profile.loop_files
+            )
             self._stats = VisionStats(
                 state="starting",
                 startup_message="Preparing vision pipeline…",
+                profile=self._profile.key,
             )
 
         self._bootstrap_thread = threading.Thread(
@@ -1189,6 +1315,13 @@ class VisionEngine:
                 self._stream_width = resolved.stream_width
                 self._stream_height = resolved.stream_height
                 self._prefer_ffmpeg_pipe = resolved.prefer_ffmpeg_pipe
+                self._last_source_label = resolved.label
+                self._last_source_kind = resolved.kind
+                self._media_fps, self._media_duration = 0.0, 0.0
+                if not resolved.is_live and isinstance(reader, OpenCvReader):
+                    fps, frames = reader.media_info()
+                    self._media_fps = fps
+                    self._media_duration = frames / fps if fps > 0 and frames > 0 else 0.0
                 if resolved.is_live and resolved.kind in {"youtube", "stream"}:
                     self._apply_live_remote_lite()
 
@@ -1223,6 +1356,7 @@ class VisionEngine:
                         running_mode=running_mode,
                         num_faces=2,
                         output_face_blendshapes=True,
+                        output_facial_transformation_matrixes=True,
                     )
                 )
             except Exception as exc:
@@ -1267,7 +1401,7 @@ class VisionEngine:
                 self._start_capture_worker(
                     reader,
                     drop_frames=resolved.is_live,
-                    loop_on_eof=(not resolved.is_live) and self._settings.source_loop,
+                    loop_on_eof=(not resolved.is_live) and self._loop_files,
                 )
                 if resolved.is_live and resolved.kind in {"youtube", "stream"}:
                     self._start_live_preview()
@@ -1286,16 +1420,26 @@ class VisionEngine:
                 self._last_infer_seq = 0
                 self._last_infer_at = 0.0
                 self._live_since = time.time()
+                self._session_started_at = self._live_since
+                self._session_ended_at = None
+                self._media_position = 0.0
+                self._processing_speed = 0.0
                 self._frame_index = 0
                 self._loop_last_tick = time.time()
                 self._loop_error_streak = 0
-                self._stats = VisionStats(state="live", degraded=degraded)
+                self._stats = VisionStats(
+                    state="live", degraded=degraded, profile=self._profile.key
+                )
+                self._ai_budget.reset()
+                self._verify_requested.clear()
+                self._expressions.reset()
+                self._insights.start(self._profile.key)
+                self._sync_expression_layers()
 
             self._thread = threading.Thread(target=self._loop, daemon=True)
             self._thread.start()
             self._gemini.start()
             self._identity.start()
-            self._expression.set_active(self._config.show_expressions)
         except Exception as exc:
             self._release_models(reader, pose, face, hand)
             with self._lock:
@@ -1326,8 +1470,8 @@ class VisionEngine:
 
         self._gemini.stop()
         self._identity.stop()
-        self._expression.set_active(False)
-        self._micro_tracker.reset()
+        self._insights.stop()
+        self._expressions.set_enabled(False)
         self._track_labels.reset()
         self._stop_live_preview()
 
@@ -1357,6 +1501,8 @@ class VisionEngine:
             self._stream_frame_seq = 0
             self._stream_fps = 0.0
             self._annotated_jpeg = None
+            if self._session_started_at is not None and self._session_ended_at is None:
+                self._session_ended_at = time.time()
             self._live_since = None
             self._frame_index = 0
             self._source_label = ""
@@ -1385,8 +1531,45 @@ class VisionEngine:
         detections = sv.Detections.from_ultralytics(results)
         return self._tracker.update_with_detections(detections)
 
+    def _maybe_request_scene(
+        self,
+        frame: np.ndarray,
+        config: VisionConfig,
+        track_items: list[dict[str, float | int | str | None | bool]],
+        detections: sv.Detections,
+    ) -> bytes | None:
+        """Send a frame to YUBI v3.0 only when the scene changed or a new track needs a label."""
+        if not (self._gemini.enabled and config.show_gemini and self._gemini.ready()):
+            return None
+        height, width = frame.shape[:2]
+        uncertain: list[dict[str, object]] = []
+        if track_items:
+            uncertain = [
+                hint
+                for hint in collect_uncertain_hints(
+                    track_items, detections, self._settings.gemini_verify_below, width, height
+                )
+                if self._track_labels.get(int(hint["tracker_id"])) is None
+            ]
+        # Each track forces at most one early verification pass; later passes are change-gated.
+        fresh = [h for h in uncertain if int(h["tracker_id"]) not in self._verify_requested]
+        reason = self._gemini.consider(
+            scene_thumbnail(frame), scene_signature(track_items), force=bool(fresh)
+        )
+        if reason is None:
+            return None
+        jpeg = encode_frame_jpeg(
+            frame,
+            max_width=analysis_width_for_frame(width, self._settings),
+            quality=self._settings.gemini_jpeg_quality,
+        )
+        if jpeg:
+            self._verify_requested.update(int(h["tracker_id"]) for h in uncertain)
+            self._gemini.push_frame(jpeg, uncertain)
+        return jpeg
+
     def _loop(self) -> None:
-        timestamp_ms = 0
+        timestamp_ms = -1
         read_failures = 0
         fps_clock = time.perf_counter()
         fps_value = 0.0
@@ -1395,9 +1578,20 @@ class VisionEngine:
         stride = max(1, self._settings.yolo_stride)
         last_detections = sv.Detections.empty()
         writer: cv2.VideoWriter | None = None
+        wall_start = time.perf_counter()
+        last_scene_at = 0.0
 
         with self._lock:
             degraded = list(self._stats.degraded)
+            playback = (
+                None
+                if self._source_is_live
+                else _PlaybackClock(
+                    self._media_fps,
+                    self._media_duration,
+                    self._settings.source_realtime_pacing,
+                )
+            )
 
         while True:
             with self._lock:
@@ -1413,6 +1607,7 @@ class VisionEngine:
             if capture is None or self._frame_reader is None:
                 break
 
+            meta: FrameMeta | None = None
             if self._is_remote_live_stream():
                 seq, frame = capture.snapshot_frame()
                 if frame is None:
@@ -1427,7 +1622,7 @@ class VisionEngine:
                     self._last_infer_at = now
                     self._last_infer_seq = seq
             else:
-                ok, frame = capture.read_latest()
+                ok, frame, meta = capture.read_frame()
             if not ok or frame is None:
                 if (
                     capture.ended
@@ -1483,20 +1678,11 @@ class VisionEngine:
                 frame = downscale_frame(frame, self._processing_max_width())
                 height, width = frame.shape[:2]
 
-                analysis_jpeg: bytes | None = None
-                needs_gemini_jpeg = (
-                    self._gemini.enabled
-                    and config.show_objects
-                    and config.show_gemini
-                    and self._gemini.wants_new_analysis()
-                )
-                if needs_gemini_jpeg:
-                    analysis_width = analysis_width_for_frame(width, self._settings)
-                    analysis_jpeg = encode_frame_jpeg(
-                        frame,
-                        max_width=analysis_width,
-                        quality=self._settings.gemini_jpeg_quality,
-                    )
+                if playback is not None and meta is not None:
+                    analysis_t, media_sec = playback.stamp(meta)
+                else:
+                    analysis_t = time.perf_counter() - wall_start
+                    media_sec = analysis_t
 
                 yolo_confidence = effective_object_confidence(
                     config.confidence,
@@ -1507,7 +1693,7 @@ class VisionEngine:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-                timestamp_ms += 33
+                timestamp_ms = max(timestamp_ms + 1, int(analysis_t * 1000.0))
                 infer_start = time.perf_counter()
                 need_face = config.show_face or config.show_expressions
                 pose_result = pose.detect_for_video(mp_image, timestamp_ms) if pose else None
@@ -1518,25 +1704,18 @@ class VisionEngine:
                 )
                 hand_result = hand.detect_for_video(mp_image, timestamp_ms) if hand else None
 
-                micro_events: list = []
-                if config.show_expressions and face_result and face_result.face_blendshapes:
-                    for idx, shapes in enumerate(face_result.face_blendshapes):
-                        micro_events.extend(self._micro_tracker.update(idx, shapes))
-
-                if (
-                    config.show_expressions
-                    and face_result
-                    and face_result.face_landmarks
-                    and self._expression.wants_face_analysis()
-                ):
-                    face_jpeg = crop_face_jpeg(
+                expression_frame: ExpressionFrame | None = None
+                if config.show_expressions and face_result is not None:
+                    self._expressions.capture_crops = self._insights.wants_crops
+                    expression_frame = self._expressions.process(
+                        face_result,
                         frame,
-                        face_result.face_landmarks[0],
-                        self._settings.gemini_analysis_scale,
-                        self._settings.gemini_jpeg_quality,
+                        analysis_t,
+                        media_sec,
+                        hand_points=normalized_hand_points(hand_result),
                     )
-                    if face_jpeg:
-                        self._expression.push_face_frame(face_jpeg)
+                    if expression_frame.episodes:
+                        self._insights.push_episodes(expression_frame.episodes)
 
                 if config.show_objects and yolo is not None:
                     if frame_index % stride == 0:
@@ -1576,22 +1755,20 @@ class VisionEngine:
                 track_items: list[dict[str, float | int | str | None | bool]] = []
                 display_detections = detections
                 box_labels: list[str] = []
+                has_objects = (
+                    config.show_objects and not detections.is_empty() and yolo is not None
+                )
+                if has_objects:
+                    track_items = list_tracked_objects(detections, yolo.names)
+                scene_jpeg = self._maybe_request_scene(frame, config, track_items, detections)
                 gemini_insight = self._gemini.get_insight()
+                if gemini_insight.updated_at and gemini_insight.updated_at != last_scene_at:
+                    last_scene_at = gemini_insight.updated_at
+                    self._insights.note_scene(gemini_insight.scene_summary)
 
-                if config.show_objects and not detections.is_empty() and yolo is not None:
+                if has_objects:
                     class_names = yolo.names
-                    track_items = list_tracked_objects(detections, class_names)
                     if self._gemini.enabled and config.show_gemini:
-                        if analysis_jpeg:
-                            uncertain = collect_uncertain_hints(
-                                track_items,
-                                detections,
-                                self._settings.gemini_verify_below,
-                                width,
-                                height,
-                            )
-                            self._gemini.push_frame(analysis_jpeg, uncertain)
-                        gemini_insight = self._gemini.get_insight()
                         track_items = reconcile_tracked_objects(
                             track_items,
                             detections,
@@ -1638,7 +1815,7 @@ class VisionEngine:
                         if person_hints and self._identity.wants_new_analysis(
                             person_hints
                         ):
-                            identity_jpeg = analysis_jpeg or encode_frame_jpeg(
+                            identity_jpeg = scene_jpeg or encode_frame_jpeg(
                                 frame,
                                 max_width=analysis_width_for_frame(
                                     width, self._settings
@@ -1676,14 +1853,9 @@ class VisionEngine:
                         annotated = draw_pose_labels(
                             annotated, pose_kp, color=(197, 204, 212)
                         )
-                if config.show_expressions and face_result and face_result.face_landmarks:
-                    guidance = self._expression.get_guidance()
-                    annotated = draw_expression_overlay(
-                        annotated,
-                        face_result.face_landmarks,
-                        guidance,
-                        micro_events,
-                    )
+                if config.show_expressions:
+                    if expression_frame is not None and expression_frame.renders:
+                        annotated = draw_expression_overlay(annotated, expression_frame.renders)
                 elif config.show_face:
                     annotated = self._face_edge.annotate(scene=annotated, key_points=face_kp)
                     annotated = self._face_vertex.annotate(scene=annotated, key_points=face_kp)
@@ -1691,7 +1863,7 @@ class VisionEngine:
                     annotated = self._hand_edge.annotate(scene=annotated, key_points=hand_kp)
                     annotated = self._hand_vertex.annotate(scene=annotated, key_points=hand_kp)
 
-                if config.show_gemini and self._gemini.enabled:
+                if config.show_gemini and config.show_objects and self._gemini.enabled:
                     annotated = draw_gemini_boxes(
                         annotated,
                         gemini_insight,
@@ -1761,6 +1933,11 @@ class VisionEngine:
                         recording=writer is not None,
                         alerts=alert_items,
                     )
+                    self._media_position = media_sec
+
+                if playback is not None:
+                    playback.pace_and_measure(analysis_t)
+                    self._processing_speed = playback.speed
 
                 self._loop_last_tick = time.time()
                 self._loop_error_streak = 0

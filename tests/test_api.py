@@ -21,6 +21,8 @@ def test_health() -> None:
     assert payload["vision_state"] == "idle"
     assert "youtube_cache_dir" in payload
     assert payload["youtube_cache_dir"]
+    assert {p["key"] for p in payload["profiles"]} == {"general", "interview", "security"}
+    assert payload["report_steps"]
 
 
 def test_config_round_trip() -> None:
@@ -49,6 +51,34 @@ def test_record_requires_live() -> None:
     response = client.post("/api/record/stop")
     assert response.status_code == 200
     assert response.json() == {"recording": False}
+
+
+def test_status_exposes_intelligence_without_model_names() -> None:
+    response = client.get("/api/status")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["expressions"]["state"] in {"off", "idle", "no_face"}
+    assert "state" in payload["insights"]
+    assert payload["ai_usage"]["calls"] == 0
+    assert "gemini" not in str(payload["ai_usage"]).lower()
+    assert "gemini" not in str(payload["insights"]).lower()
+
+
+def test_analysis_endpoints_when_idle() -> None:
+    response = client.get("/api/analysis")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["expressions"]["episodes"] == []
+    assert "ai_usage" in payload
+
+    response = client.get("/api/analysis/export")
+    assert response.status_code == 200
+    assert "attachment" in response.headers["content-disposition"]
+    assert response.json()["session"] is not None
+
+    response = client.get("/api/analysis/report.md")
+    assert response.status_code == 200
+    assert response.text == ""
 
 
 def test_start_stop_lifecycle() -> None:

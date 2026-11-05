@@ -5,7 +5,7 @@ description = "YUBI Supervision — live vision command center with YOLOv8, Medi
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "supervision>=0.25.0",
+    "supervision>=0.25.0,<0.30",
     "mediapipe>=0.10.14",
     "opencv-python>=4.8.0",
     "fastapi>=0.110.0",
