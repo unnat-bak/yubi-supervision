@@ -22,6 +22,7 @@ Production evolution plan. Items are ordered; earlier phases unblock later ones.
 
 ## Phase 3 — Code structure
 
+- Migrate tracking off `sv.ByteTrack` (removed in supervision 0.30; currently pinned `<0.30`) to the Roboflow `trackers` package
 - Split `vision.py` into `backend/vision/` package (see ARCHITECTURE.md)
 - Rename internal `gemini_*` API paths to `v3` while keeping aliases
 - Pydantic response models for all endpoints
